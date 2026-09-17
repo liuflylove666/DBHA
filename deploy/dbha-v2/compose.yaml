@@ -1,0 +1,229 @@
+name: dbha-v2-lab
+
+x-runtime: &runtime
+  image: dbha-v2-lab-runtime:local
+  platform: linux/amd64
+  volumes:
+    - ./generated:/etc/dbha:ro
+  restart: "no"
+
+x-node-env: &node-env
+  MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Run configure.py first}
+  MYSQL_ROOT_HOST: "%"
+  MYSQL_REPL_USER: ${MYSQL_REPL_USER}
+  MYSQL_REPL_PASSWORD: ${MYSQL_REPL_PASSWORD}
+  DBHA_USER: ${DBHA_USER}
+  DBHA_PASSWORD: ${DBHA_PASSWORD}
+  APP_PASSWORD: ${APP_PASSWORD}
+  SSH_PASSWORD: ${SSH_PASSWORD}
+
+x-mysql: &mysql
+  image: dbha-v2-lab-mysql:local
+  platform: linux/amd64
+  build:
+    context: ./nodes
+    dockerfile: Dockerfile.mysql
+  environment: *node-env
+  restart: "no"
+  healthcheck:
+    test: ["CMD-SHELL", "MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysql -h127.0.0.1 -uroot -Nse 'SELECT 1' >/dev/null"]
+    interval: 5s
+    timeout: 5s
+    retries: 40
+    start_period: 30s
+
+x-proxy: &proxy
+  image: dbha-v2-lab-proxy:local
+  platform: linux/amd64
+  build:
+    context: ./nodes
+    dockerfile: Dockerfile.proxy
+  environment:
+    PROXY_ADMIN_USER: ${PROXY_ADMIN_USER}
+    PROXY_ADMIN_PASSWORD: ${PROXY_ADMIN_PASSWORD}
+    SSH_PASSWORD: ${SSH_PASSWORD}
+    API_TOKEN: ${API_TOKEN}
+    METADATA_URL: http://10.203.80.12:8080/api/v1/metadata
+  depends_on:
+    metadata-api:
+      condition: service_healthy
+    receiver:
+      condition: service_started
+    bootstrap:
+      condition: service_completed_successfully
+  restart: "no"
+
+services:
+  metadata-store:
+    image: mysql:8.0-debian
+    platform: linux/amd64
+    # v2 metadata cache writes a zero deleted_at timestamp.
+    command: ["--sql-mode=STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_ROOT_HOST: "%"
+    volumes:
+      - metadata-data:/var/lib/mysql
+      - ../../dbm-services/common/dbha-v2/tools/cmd/standalone-metadata/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      - ../../dbm-services/common/dbha-v2/tools/cmd/standalone-metadata/seed.sql:/docker-entrypoint-initdb.d/20-seed.sql:ro
+    networks:
+      lab:
+        ipv4_address: 10.203.80.10
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysql -h127.0.0.1 -uroot -Nse 'SELECT 1 FROM dbha_metadata.standalone_instances LIMIT 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+
+  etcd:
+    image: gcr.io/etcd-development/etcd:v3.6.0
+    command: ["/usr/local/bin/etcd", "--name=lab", "--data-dir=/etcd-data", "--listen-client-urls=http://0.0.0.0:2379", "--advertise-client-urls=http://10.203.80.11:2379", "--listen-peer-urls=http://0.0.0.0:2380", "--initial-advertise-peer-urls=http://10.203.80.11:2380", "--initial-cluster=lab=http://10.203.80.11:2380"]
+    volumes:
+      - etcd-data:/etcd-data
+    networks:
+      lab:
+        ipv4_address: 10.203.80.11
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  metadata-api:
+    <<: *runtime
+    command: ["standalone-metadata"]
+    environment:
+      MYSQL_DSN: root:${MYSQL_ROOT_PASSWORD}@tcp(10.203.80.10:3306)/dbha_metadata?parseTime=true
+      API_TOKEN: ${API_TOKEN}
+    depends_on:
+      metadata-store:
+        condition: service_healthy
+    networks:
+      lab:
+        ipv4_address: 10.203.80.12
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    <<: *runtime
+    command: ["dbha-admin", "migrate", "--type", "all", "-c", "/etc/dbha/admin.yaml"]
+    depends_on:
+      metadata-store:
+        condition: service_healthy
+    networks: [lab]
+
+  admin:
+    <<: *runtime
+    command: ["dbha-admin", "-c", "/etc/dbha/admin.yaml"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      etcd:
+        condition: service_healthy
+      metadata-api:
+        condition: service_healthy
+    networks:
+      lab:
+        ipv4_address: 10.203.80.13
+
+  receiver:
+    <<: *runtime
+    command: ["dbha-receiver", "-c", "/etc/dbha/receiver.yaml"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      etcd:
+        condition: service_healthy
+    networks:
+      lab:
+        ipv4_address: 10.203.80.14
+
+  analysis:
+    <<: *runtime
+    command: ["dbha-analysis", "-c", "/etc/dbha/analysis.yaml"]
+    depends_on:
+      admin:
+        condition: service_started
+      bootstrap:
+        condition: service_completed_successfully
+    networks:
+      lab:
+        ipv4_address: 10.203.80.15
+
+  mysql-master:
+    <<: *mysql
+    command: ["--server-id=21", "--log-bin=mysql-bin", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--log-slave-updates=ON", "--binlog-format=ROW", "--sync-binlog=1", "--innodb-flush-log-at-trx-commit=1", "--default-authentication-plugin=mysql_native_password"]
+    volumes:
+      - master-data:/var/lib/mysql
+      - ./generated/mysql-master-probe.yaml:/etc/dbha/probe.yaml:ro
+    depends_on:
+      receiver:
+        condition: service_started
+    networks:
+      lab:
+        ipv4_address: 10.203.80.21
+
+  mysql-standby:
+    <<: *mysql
+    command: ["--server-id=22", "--log-bin=mysql-bin", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--log-slave-updates=ON", "--binlog-format=ROW", "--sync-binlog=1", "--innodb-flush-log-at-trx-commit=1", "--default-authentication-plugin=mysql_native_password"]
+    volumes:
+      - standby-data:/var/lib/mysql
+      - ./generated/mysql-standby-probe.yaml:/etc/dbha/probe.yaml:ro
+    depends_on:
+      receiver:
+        condition: service_started
+    networks:
+      lab:
+        ipv4_address: 10.203.80.22
+
+  bootstrap:
+    image: dbha-v2-lab-mysql:local
+    platform: linux/amd64
+    entrypoint: ["bash", "/usr/local/bin/mysql-replication.sh"]
+    environment:
+      <<: *node-env
+      MYSQL_MASTER: 10.203.80.21
+      MYSQL_STANDBY: 10.203.80.22
+    volumes:
+      - bootstrap-state:/state
+    depends_on:
+      mysql-master:
+        condition: service_healthy
+      mysql-standby:
+        condition: service_healthy
+    networks: [lab]
+
+  proxy1:
+    <<: *proxy
+    volumes:
+      - ./generated/proxy1-probe.yaml:/etc/dbha/probe.yaml:ro
+    ports: ["127.0.0.1:13306:10000"]
+    networks:
+      lab:
+        ipv4_address: 10.203.80.31
+
+  proxy2:
+    <<: *proxy
+    volumes:
+      - ./generated/proxy2-probe.yaml:/etc/dbha/probe.yaml:ro
+    ports: ["127.0.0.1:13307:10000"]
+    networks:
+      lab:
+        ipv4_address: 10.203.80.32
+
+networks:
+  lab:
+    ipam:
+      config:
+        - subnet: 10.203.80.0/24
+
+volumes:
+  metadata-data:
+  etcd-data:
+  master-data:
+  standby-data:
+  bootstrap-state:

@@ -1,0 +1,18 @@
+[Unit]
+Description=DBHA research MySQL container
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+RequiresMountsFor=/srv/dbha/mysql
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/bin/docker rm dbha-mysql
+ExecStart=/usr/bin/docker run --rm --name dbha-mysql --network host --env-file /etc/dbha/mysql.env -v /srv/dbha/mysql:/var/lib/mysql -v /etc/dbha/mysql.cnf:/etc/mysql/conf.d/dbha.cnf:ro -v /etc/dbha/mysql-init:/docker-entrypoint-initdb.d:ro mysql:8.0-debian
+ExecStop=/usr/bin/docker stop --time 60 dbha-mysql
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

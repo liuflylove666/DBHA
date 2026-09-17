@@ -1,0 +1,11 @@
+ARG DBHA_RUNTIME_IMAGE=dbha-v2-lab-runtime:local
+FROM ${DBHA_RUNTIME_IMAGE} AS dbha-runtime
+FROM mysql:8.0-debian
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-server ca-certificates && rm -rf /var/lib/apt/lists/* && mkdir -p /run/sshd
+COPY --from=dbha-runtime /usr/local/bin/dbha-probe /usr/local/bin/dbha-probe
+COPY mysql-init.sh /docker-entrypoint-initdb.d/10-dbha-init.sh
+COPY mysql-replication.sh /usr/local/bin/mysql-replication.sh
+COPY mysql-node-entrypoint.sh /usr/local/bin/mysql-node-entrypoint.sh
+RUN chmod +x /docker-entrypoint-initdb.d/10-dbha-init.sh /usr/local/bin/mysql-replication.sh /usr/local/bin/mysql-node-entrypoint.sh
+EXPOSE 3306 22
+ENTRYPOINT ["/usr/local/bin/mysql-node-entrypoint.sh"]

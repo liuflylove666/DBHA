@@ -1,0 +1,9 @@
+**
+!dbm-services/
+!dbm-services/common/
+!dbm-services/common/dbha-v2/
+!dbm-services/common/dbha-v2/**
+!dbm-services/common/go-pubpkg/
+!dbm-services/common/go-pubpkg/**
+dbm-services/common/dbha-v2/build/
+dbm-services/common/dbha-v2/logs/

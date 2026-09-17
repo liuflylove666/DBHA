@@ -1,0 +1,45 @@
+name: {{PROBE_NAME}}
+version: {{COMMON_VERSION}}
+
+serviceID: "{{PROBE_SERVICE_ID}}"
+pidFile: "{{PROBE_PID_FILE}}"
+
+reporter:
+  name: {{PROBE_REPORTER_NAME}}
+  endpoint: "{{PROBE_REPORTER_ENDPOINT}}"
+  dataID: {{PROBE_REPORTER_DATA_ID}}
+  connTimeout: {{PROBE_REPORTER_CONN_TIMEOUT}}
+  bkCloudID: {{PROBE_REPORTER_BKCLOUD_ID}}
+  # local TCP port for the GSE agent-report SDK on Windows; 0 (default) means
+  # unset -> Linux ignores it and falls back to the domain socket endpoint.
+  localSocketPort: {{PROBE_REPORTER_LOCAL_SOCKET_PORT}}
+
+client:
+  pingTime: {{PROBE_CLIENT_PING_TIME}}
+  pingTimeout: {{PROBE_CLIENT_PING_TIMEOUT}}
+  maxReceiveMessageSize: {{PROBE_CLIENT_MAX_RECEIVE_MESSAGE_SIZE}}
+  maxSendMessageSize: {{PROBE_CLIENT_MAX_SEND_MESSAGE_SIZE}}
+  receiverReconnectInterval: {{PROBE_CLIENT_RECEIVER_RECONNECT_INTERVAL}}
+  receiverMaxReconnectAttempts: {{PROBE_CLIENT_RECEIVER_MAX_RECONNECT_ATTEMPTS}}
+
+# Where this probe refreshes its own configuration from, and how often. Each round asks admin
+# for this machine's config and rewrites the reporter / harvester sections of this file when
+# they differ, then hot-reloads. Everything else in this file, including this block, is left
+# alone, so local edits survive.
+# syncInterval accepts a Go duration; 0 (default) disables periodic sync and leaves the file
+# under gen-config's control only. Values below 10s are raised to 10s.
+admin:
+  endpoints: [{{PROBE_ADMIN_ENDPOINTS}}]
+  bkCloudID: {{PROBE_ADMIN_BK_CLOUD_ID}}
+  localIP: "{{PROBE_ADMIN_LOCAL_IP}}"
+  syncInterval: {{PROBE_ADMIN_SYNC_INTERVAL}}
+
+harvester:
+{{PROBE_MYSQL_SHARD_BLOCK}}
+{{PROBE_REDIS_SHARD_BLOCK}}
+
+log:
+  path: "{{PROBE_LOG_PATH}}"
+  level: {{COMMON_LOG_LEVEL}}
+  fileCount: {{COMMON_LOG_FILE_COUNT}}
+  fileSize: {{COMMON_LOG_FILE_SIZE}}

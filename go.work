@@ -1,0 +1,6 @@
+go 1.26.0
+
+use (
+	./dbm-services/common/dbha-v2
+	./dbm-services/common/go-pubpkg
+)

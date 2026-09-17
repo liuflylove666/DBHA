@@ -1,0 +1,4 @@
+.env
+generated/
+generated-multi/
+__pycache__/

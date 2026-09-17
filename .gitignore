@@ -1,0 +1,29 @@
+# Local runtime state and credentials
+.env
+.env.*
+!.env.example
+secrets.env
+inventory.json
+generated/
+generated-*/
+*.pem
+*.key
+*.log
+*.log.*
+*.pid
+*.db
+*.sqlite*
+logs/
+pids/
+build/
+bin/
+
+# Developer caches
+.DS_Store
+.idea/
+.vscode/
+.omx/
+__pycache__/
+*.pyc
+*.swp
+coverage.out
