@@ -114,6 +114,8 @@ generated/
 └── _generated/       # 身份、管理员 token 和内部生成文件
 ```
 
+七台机器每个配置文件的完整示例内容、安装路径、占位符含义和 systemd 单元链接见 [EC2 七节点逐机配置文件参考](HOST_CONFIGS.md)。该参考展开了三个 `server.json`、三个 `etcd.env`、四个 `discovery.json`、MySQL/Proxy 配置及所有凭据文件；真实部署仍必须使用生成器产生的值。
+
 所有私密文件模式为 0600。`generated/`、`inventory.json` 和 `dist/` 不得提交 Git。备份 `generated/_generated/identity.json` 与 `generated/_generated/admin.token`；丢失后不要重新生成一套身份覆盖现有 etcd 数据。
 
 ## 4. 安装三个 controller
