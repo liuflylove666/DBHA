@@ -2,8 +2,8 @@ GO ?= go
 PYTHON ?= python3
 MODULE := ./dbm-services/common/dbha-v2
 SHARED := ./dbm-services/common/go-pubpkg
-SERVICES := admin receiver analysis probe
-BINARIES := $(addprefix bin/dbha-,$(SERVICES)) bin/standalone-metadata
+SERVICES := server probe
+BINARIES := $(addprefix bin/dbha-,$(SERVICES))
 export GOWORK := $(CURDIR)/go.work
 
 .PHONY: build test check test-config $(BINARIES)

@@ -1,4 +1,6 @@
 .env
 generated/
 generated-multi/
+backups/
+.build/
 __pycache__/

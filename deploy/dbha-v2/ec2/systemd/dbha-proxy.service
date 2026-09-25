@@ -1,13 +1,13 @@
 [Unit]
 Description=BlueKing Proxy for DBHA research (vendor release in local image)
-Requires=docker.service
-After=docker.service network-online.target
+Requires=docker.service dbha-probe.service
+After=docker.service dbha-probe.service network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStartPre=-/usr/bin/docker rm dbha-proxy
-ExecStart=/usr/bin/docker run --rm --name dbha-proxy --network host --env-file /etc/dbha/proxy.env -v /var/log/mysql-proxy:/var/log/mysql-proxy dbha-ec2-proxy:local
+ExecStart=/usr/bin/docker run --rm --name dbha-proxy --network host --pid host --env-file /etc/dbha/proxy.env -v /etc/dbha/discovery.json:/etc/dbha/discovery.json:ro -v /etc/dbha/agent.token:/etc/dbha/agent.token:ro -v /srv/dbha/probe:/var/lib/dbha-probe -v /run/dbha:/run/dbha -v /var/log/dbha:/var/log/dbha dbha-ec2-proxy:local
 ExecStop=/usr/bin/docker stop --time 30 dbha-proxy
 Restart=on-failure
 RestartSec=10

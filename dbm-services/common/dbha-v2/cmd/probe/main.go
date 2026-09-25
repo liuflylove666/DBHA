@@ -25,13 +25,23 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"dbm-services/common/dbha-v2/internal/probe"
+	probediscovery "dbm-services/common/dbha-v2/internal/probe/discovery"
 
 	"github.com/spf13/cobra"
 )
+
+type healthExit struct{ code int }
+
+func (e healthExit) Error() string { return "local discovery health failed" }
 
 func run(args []string) int {
 	// cobra falls back to os.Args[1:] when the args slice is nil, which is the
@@ -80,10 +90,37 @@ func run(args []string) int {
 	rootCmd.AddCommand(probe.GenConfigCmd)
 	rootCmd.AddCommand(probe.EnsureCmd)
 	rootCmd.AddCommand(probe.EnsureKeepaliveCmd)
+	rootCmd.AddCommand(&cobra.Command{Use: "discover", Short: "Run authenticated automatic metadata discovery", RunE: func(cmd *cobra.Command, args []string) error {
+		path, err := cmd.Root().PersistentFlags().GetString("config")
+		if err != nil {
+			return err
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return probediscovery.Run(ctx, path)
+	}})
+	rootCmd.AddCommand(&cobra.Command{Use: "discover-health", Short: "Read local MySQL health as JSON without a server session", RunE: func(cmd *cobra.Command, args []string) error {
+		path, err := cmd.Root().PersistentFlags().GetString("config")
+		if err != nil {
+			return err
+		}
+		result, code := probediscovery.HealthCheck(path)
+		if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+			return err
+		}
+		if code != 0 {
+			return healthExit{code: code}
+		}
+		return nil
+	}})
 
 	rootCmd.SetArgs(args)
 
 	if err := rootCmd.Execute(); err != nil {
+		var localHealth healthExit
+		if errors.As(err, &localHealth) {
+			return localHealth.code
+		}
 		fmt.Println("failed to execute probe. errmsg:", err.Error())
 		return 1
 	}

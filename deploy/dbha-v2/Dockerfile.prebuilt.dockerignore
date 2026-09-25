@@ -1,0 +1,6 @@
+**
+!deploy/
+!deploy/dbha-v2/
+!deploy/dbha-v2/.build/
+!deploy/dbha-v2/.build/dbha-server
+!deploy/dbha-v2/.build/dbha-probe

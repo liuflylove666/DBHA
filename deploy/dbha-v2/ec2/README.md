@@ -1,297 +1,25 @@
-# EC2 从零部署 DBHA v2：源码编译 + systemd
+# EC2 Docker 部署：三控制节点、自动发现与无 VIP 高可用
 
-本手册对应 [DBHA 独立项目](https://github.com/liuflylove666/DBHA)中的 DBHA v2 和 standalone metadata 适配器。目标是五台 EC2 的研究环境，实际执行命令前请把示例 IP 替换成你创建的 EC2 私网 IP。
+本文说明当前推荐的 EC2 部署方式：三台 controller 组成三节点 etcd，并运行三个常驻 `dbha-server`；两台 MySQL 和两台蓝鲸 Proxy 作为业务节点。所有客户端使用 controller 私网地址池，不使用 VIP、Keepalived、DNS 切换或云 API。默认使用隔离 VPC 内的明文 HTTP/gRPC，不要求 TLS。
 
-本手册采用以下安装方式：
+当前交付采用宿主机 systemd 与 Docker 的组合：
 
-- `dbha-admin`、`dbha-receiver`、`dbha-analysis`、`dbha-probe`、`standalone-metadata` 在 EC2 用 Go 从源码编译，安装到 `/opt/dbha/bin`，由原生 systemd 管理。
-- MySQL 和 etcd 使用官方项目镜像，systemd 管理对应的 `docker run` 进程。
-- 蓝鲸定制 Proxy 没有已取得的完整源码或已确认的官方镜像；本目录把蓝鲸官方 release 包封装成自己的镜像。**这个 Proxy 镜像不是蓝鲸官方镜像，也不是源码编译产物。**如果要求 Proxy 也只使用官方镜像，本方案在此处缺少已确认的交付物，不能拿普通上游 Proxy 直接替换。
-- probe 与 SSH 都在 EC2 宿主机。此前 `nodes/` 的“数据库 + probe + SSH 同容器”镜像不用于本手册。
-
-本手册尚未在五台真实 EC2 上完成部署和故障演练。下文的 Docker HA、辅助配置、systemd 静态检查和 Proxy 容器结果是来源工作区的历史验证记录；五台真实 EC2 的网络、权限、故障切换需要按以下步骤验收。
-
-## 0. 先认识机器和网络
-
-| 名称 | 示例私网 IP | 可用区 | 运行内容 | 研究环境资源估算 |
-|---|---|---|---|---|
-| controller | 10.80.10.10 | AZ-A | 管理 MySQL、etcd、metadata、admin、receiver、analysis；源码编译 | x86_64，4 vCPU / 16 GiB |
-| mysql1 | 10.80.10.21 | AZ-A | 业务 MySQL 初始主库、原生 probe、SSH | x86_64，2–4 vCPU / 8–16 GiB |
-| mysql2 | 10.80.20.22 | AZ-B | 业务 MySQL 初始备库、原生 probe、SSH | 同 mysql1 |
-| proxy1 | 10.80.10.31 | AZ-A | Proxy 容器、原生 probe、SSH | x86_64，2 vCPU / 4 GiB |
-| proxy2 | 10.80.20.32 | AZ-B | Proxy 容器、原生 probe、SSH | 同 proxy1 |
-
-这些是实验资源估算，不是容量压测结果或价格承诺。统一选 **Ubuntu Server 24.04 LTS amd64**，不要选 Graviton/arm64，以匹配已验证的 Proxy 发布包。
-
-本手册只有业务节点跨 AZ，controller 仍是单点。因此它演示数据库主机故障切换，不保证管理面或整区故障下持续可用。[AWS 子网与可用区说明](https://docs.aws.amazon.com/vpc/latest/userguide/configure-subnets.html)。
-
-```mermaid
-flowchart LR
-  C[controller: 原生 HA 控制服务] --> Meta[原生 metadata API]
-  Meta --> Mgmt[(controller 管理 MySQL)]
-  C --> E[controller etcd]
-  N1[mysql1: MySQL + 宿主机 probe] -->|GTID| N2[mysql2: MySQL + 宿主机 probe]
-  P1[proxy1: Proxy + 宿主机 probe] --> N1
-  P2[proxy2: Proxy + 宿主机 probe] --> N1
-  N1 -->|gRPC 指标| C
-  N2 -->|gRPC 指标| C
-  P1 -->|gRPC 指标| C
-  P2 -->|gRPC 指标| C
-  C -. SSH 检查、SQL 切换 .-> N1
-  C -. 提升 .-> N2
-  C -. 更新路由 .-> P1
-  C -. 更新路由 .-> P2
-```
-
-## 1. 在 AWS 控制台创建基础资源
-
-以下选用“有公网出口、只开放管理 SSH”的简单研究网络。生产环境可使用私有子网、NAT 与堡垒机/SSM，但不要在未验证 SSH 二次确认前启用切换。
-
-1. 选择一个 AWS Region，全套资源在同一 Region。
-2. 创建 VPC，IPv4 CIDR：`10.80.0.0/16`，开启 DNS resolution 和 DNS hostnames。
-3. 创建两条子网：AZ-A 为 `10.80.10.0/24`，AZ-B 为 `10.80.20.0/24`。
-4. 创建并附加 Internet Gateway。两条子网关联的路由表保留 VPC local 路由，并增加 `0.0.0.0/0 -> Internet Gateway`。
-5. 创建 EC2 密钥对，下载 PEM，保存在管理电脑，权限设置为 `chmod 600`。不要把 PEM 放进源码包、数据库目录或提交 Git。
-6. 按表创建五台 Ubuntu amd64 EC2，手动指定私网 IP，研究阶段分配公网 IPv4，以便你的电脑 SSH 和服务器下载依赖。服务配置始终使用**私网 IP**，不填公网 IP。[EC2 地址说明](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-instance-addressing.html)。
-7. controller 的系统盘建议至少 60 GiB；MySQL/controller 各增加一块空的加密 gp3 数据盘，例如研究用 100 GiB。实际容量按数据量调整。
-8. 使用默认研究网络 ACL；如果自定义了 ACL，必须放行相应流量与返回临时端口。
-
-### 1.1 安全组
-
-创建 `sg-dbha-control`、`sg-dbha-mysql`、`sg-dbha-proxy`。下面是**入站**规则；研究阶段出站允许访问互联网下载源和 VPC 内目标。安全组来源选择另一个安全组时填真实 SG ID。
-
-| 目标安全组 | TCP 端口 | 允许来源 | 用途 |
+| 节点 | 数量 | systemd 直接运行 | Docker 容器 |
 |---|---:|---|---|
-| 三组 | 22 | 你的管理电脑公网 IP/32 | ubuntu 密钥登录 |
-| sg-dbha-mysql、sg-dbha-proxy | 22 | sg-dbha-control | v2 对宿主机做 SSH 二次确认 |
-| sg-dbha-control | 50051、50052 | sg-dbha-mysql、sg-dbha-proxy | probe 到 admin / receiver |
-| sg-dbha-control | 8080 | sg-dbha-proxy | Proxy 启动查询元数据 |
-| sg-dbha-control | 3306、2379 | sg-dbha-control | 管理库、etcd，仅控制面 |
-| sg-dbha-mysql | 3306 | sg-dbha-control | 检测、切换、管理 |
-| sg-dbha-mysql | 3306 | sg-dbha-mysql | MySQL 主从复制 |
-| sg-dbha-mysql | 3306 | sg-dbha-proxy | Proxy 到业务 MySQL |
-| sg-dbha-proxy | 10000 | sg-dbha-control、应用服务器 SG | 数据端口 |
-| sg-dbha-proxy | 11000 | sg-dbha-control | Proxy admin 控制端口 |
+| controller | 3 | `dbha-server` | etcd 3.6.0 |
+| MySQL | 2 | `dbha-probe` | MySQL 8.0 |
+| Proxy | 2 | `dbha-probe` | 蓝鲸 MySQL Proxy + supervisor |
 
-50060 与 50080–50082 暂不对外开放，通过 controller 的本机检查或 SSH 隧道使用。单成员 etcd 的 2380 不需要对其他 EC2 放行。不要开放数据库、Proxy admin、etcd 到 `0.0.0.0/0`。
+`dbha-server` 和 `dbha-probe` 是静态 Linux/amd64 二进制，数据服务由 Docker 运行。生产 EC2 不使用仓库中的实验 Compose 文件。管理 MySQL、standalone metadata、admin、receiver 和 analysis 不参与新部署。当前代码和本机故障切换测试已通过，真实 EC2 发布前仍须完成本文的三节点故障演练。
 
-安全组是有状态规则；同时关联多个安全组时，要检查其他组是否额外放宽了入站权限。[AWS 安全组说明](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-security-groups.html)。
+## 1. 网络、主机和安全组
 
-## 2. 所有机器：初始化系统和目录
-
-从管理电脑分别登录五台机器，下面 `<PUBLIC_IP>` 必须替换：
-
-```bash
-ssh -i /path/to/dbha-ec2.pem ubuntu@<PUBLIC_IP>
-```
-
-**五台 EC2 都执行：**
-
-```bash
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl gnupg git python3 jq openssh-server
-uname -m
-# 应为 x86_64
-
-getent passwd dbha || sudo useradd --system --create-home \
-  --home-dir /var/lib/dbha --shell /bin/bash dbha
-sudo install -d -o root -g dbha -m 0750 /etc/dbha
-sudo install -d -o root -g root -m 0755 /opt/dbha/bin
-sudo install -d -o dbha -g dbha -m 0750 /var/log/dbha
-sudo systemctl enable --now ssh
-cat /etc/machine-id
-```
-
-各机器 `/etc/machine-id` 应存在且不同。probe 需要它；不要把另一台 EC2 的 `/etc/machine-id` 复制过来。
-
-### 2.1 controller、mysql1、mysql2：挂载空数据盘
-
-先识别你刚挂上的 **空 EBS 数据卷**，不要假设设备名固定：
-
-```bash
-lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,SERIAL
-sudo blkid
-```
-
-将下面变量改成核实后的空盘路径。示例 `/dev/nvme1n1` **不是让你直接照抄格式化的目标**：
-
-```bash
-DATA_DEVICE=/dev/nvme1n1
-sudo file -s "$DATA_DEVICE"
-lsblk -f "$DATA_DEVICE"
-```
-
-只有确认是新建空数据盘、没有需要保留的分区/文件系统后才执行：
-
-```bash
-sudo mkfs.ext4 "$DATA_DEVICE"
-sudo mkdir -p /srv/dbha
-sudo mount "$DATA_DEVICE" /srv/dbha
-sudo blkid -s UUID -o value "$DATA_DEVICE"
-```
-
-将返回 UUID 写入 `/etc/fstab`，例如：
-
-```text
-UUID=<实际UUID> /srv/dbha ext4 defaults,nodev,nosuid 0 2
-```
-
-然后验证：
-
-```bash
-sudo mount -a
-findmnt /srv/dbha
-sudo mkdir -p /srv/dbha/mysql
-```
-
-controller 另外执行：
-
-```bash
-sudo mkdir -p /srv/dbha/etcd
-```
-
-卷来自快照且已有文件系统时应直接挂载，不能重新 `mkfs`。EBS 设备名可能变化，fstab 使用 UUID；详见 [AWS EBS 挂载说明](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-using-volumes.html)。
-
-## 3. 五台机器：安装 Docker Engine
-
-这里 Docker 只运行 MySQL、etcd、Proxy；DBHA/metadata 不在 Docker 中运行。以下以全新 Ubuntu 24.04 为前提，使用 Docker 官方 APT 源：
-
-```bash
-sudo install -d -m 0755 /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-  | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-sudo chmod 0644 /etc/apt/keyrings/docker.gpg
-printf 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable\n' \
-  | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-sudo apt-get update
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo systemctl enable --now docker
-sudo docker version
-```
-
-如果已有 Docker 源或发行版 Docker 包，先依据 [Docker Ubuntu 安装文档](https://docs.docker.com/engine/install/ubuntu/) 处理冲突，不重复创建不同签名配置。本手册使用 `sudo docker`，无需将用户加入 Docker 管理组。
-
-controller、mysql1、mysql2 拉取 MySQL：
-
-```bash
-sudo docker pull --platform linux/amd64 mysql:8.0-debian
-```
-
-controller 拉取 etcd，并安装命令行 MySQL 客户端：
-
-```bash
-sudo docker pull gcr.io/etcd-development/etcd:v3.6.0
-sudo apt-get install -y mysql-client
-```
-
-记录镜像实际摘要：
-
-```bash
-sudo docker image inspect mysql:8.0-debian --format '{{json .RepoDigests}}'
-```
-
-同一轮实验三个 MySQL 应使用相同摘要。`8.0-debian` 是为了复现已经验证的蓝鲸兼容链路；MySQL 8.0 已到生命周期末期，本手册不是新的生产版本选型建议。换 8.4/更新版本需要重新验证认证插件、复制命令和 Proxy 兼容性。[MySQL 官方版本说明](https://dev.mysql.com/doc/relnotes/mysql/8.0/en/)。
-
-## 4. 获取本项目源码
-
-在 controller、mysql1、mysql2、proxy1、proxy2 五台 EC2 分别执行。使用本独立仓库的同一个版本；记录检出的提交号，便于核对各机器的配置脚本与 systemd 单元。
-
-```bash
-git clone https://github.com/liuflylove666/DBHA.git "$HOME/dbha-source"
-cd "$HOME/dbha-source"
-git rev-parse HEAD
-```
-
-仓库包含 standalone metadata API、EC2 配置脚本和 probe health 修复。运行 `configure.py` 后生成的 `generated/`、`generated-multi/` 和 `.env` 含环境凭据，必须留在对应机器的受限目录，不能提交到 Git。
-
-## 5. controller：安装 Go，在 EC2 原生编译
-
-本模块 `go.mod` 要求 Go 1.26.0。以下固定使用该版本工具链；工具链和操作系统依赖允许使用官方包，应用服务本身从源码构建。
-
-```bash
-cd /tmp
-curl -fLO https://go.dev/dl/go1.26.0.linux-amd64.tar.gz
-printf '%s  %s\n' \
-  aac1b08a0fb0c4e0a7c1555beb7b59180b05dfc5a3d62e40e9de90cd42f88235 \
-  go1.26.0.linux-amd64.tar.gz | sha256sum -c -
-sudo mkdir -p /opt/go1.26.0
-sudo tar -xzf go1.26.0.linux-amd64.tar.gz -C /opt/go1.26.0 --strip-components=1
-export PATH=/opt/go1.26.0/bin:$PATH
-go version
-```
-
-工具链下载及摘要来源：[Go 官方下载索引](https://go.dev/dl/?mode=json&include=all)。若该安装目录已被使用，不要混入不同版本文件。
-
-建立只供这次编译使用的 workspace：
-
-```bash
-DBHA_SOURCE="$HOME/dbha-source"
-mkdir -p /tmp/dbha-native-build/out
-cd /tmp/dbha-native-build
-go work init "$DBHA_SOURCE/dbm-services/common/dbha-v2" \
-  "$DBHA_SOURCE/dbm-services/common/go-pubpkg"
-export GOWORK=/tmp/dbha-native-build/go.work
-export GOTOOLCHAIN=local
-cd "$DBHA_SOURCE/dbm-services/common/dbha-v2"
-go mod download
-```
-
-`go.work` 已存在时跳过 `go work init`，先核实其中路径仍正确。接着逐个编译：
-
-```bash
-CGO_ENABLED=0 go build -trimpath -o /tmp/dbha-native-build/out/dbha-admin ./cmd/admin
-CGO_ENABLED=0 go build -trimpath -o /tmp/dbha-native-build/out/dbha-receiver ./cmd/receiver
-CGO_ENABLED=0 go build -trimpath -o /tmp/dbha-native-build/out/dbha-analysis ./cmd/analysis
-CGO_ENABLED=0 go build -trimpath -o /tmp/dbha-native-build/out/dbha-probe ./cmd/probe
-CGO_ENABLED=0 go build -trimpath -o /tmp/dbha-native-build/out/standalone-metadata ./tools/cmd/standalone-metadata
-
-go test -count=1 ./tools/cmd/standalone-metadata
-go test -count=1 -run TestHealthCmdUsesRootConfigFlag ./internal/probe
-sha256sum /tmp/dbha-native-build/out/*
-```
-
-元数据包内依赖真实 MySQL 的测试在没配置测试 DSN 时可能跳过；不能把它的跳过视为真实数据库验收。后面的初始化和切换验证才覆盖实际环境。
-
-安装 controller 的四个进程：
-
-```bash
-sudo install -m 0755 /tmp/dbha-native-build/out/dbha-admin /opt/dbha/bin/
-sudo install -m 0755 /tmp/dbha-native-build/out/dbha-receiver /opt/dbha/bin/
-sudo install -m 0755 /tmp/dbha-native-build/out/dbha-analysis /opt/dbha/bin/
-sudo install -m 0755 /tmp/dbha-native-build/out/standalone-metadata /opt/dbha/bin/
-```
-
-四台数据/Proxy EC2 只需要安装这次编译出的 `dbha-probe`。可以通过管理电脑中转，避免把 PEM 放进 controller：
-
-```bash
-# 管理电脑执行，先从 controller 下载你的编译产物
-scp -i /path/to/dbha-ec2.pem ubuntu@<CONTROLLER_PUBLIC_IP>:/tmp/dbha-native-build/out/dbha-probe /tmp/dbha-probe
-# 对 mysql1、mysql2、proxy1、proxy2 分别上传
-scp -i /path/to/dbha-ec2.pem /tmp/dbha-probe ubuntu@<NODE_PUBLIC_IP>:/tmp/dbha-probe
-```
-
-**四台节点：**
-
-```bash
-sudo install -m 0755 /tmp/dbha-probe /opt/dbha/bin/dbha-probe
-sha256sum /opt/dbha/bin/dbha-probe
-```
-
-摘要应与 controller 编译产物一致。这里分发的是你刚从源码编译的程序，不依赖 DBHA release 预编译包。
-
-## 6. controller：生成实际私网配置
-
-```bash
-cd "$HOME/dbha-source/deploy/dbha-v2/ec2"
-cp inventory.example.json inventory.json
-nano inventory.json
-```
-
-填入五台 EC2 的真实私网 IP，不是公网 IP。例如：
+推荐 Ubuntu 24.04 amd64。七台机器必须使用唯一私网 IPv4，并保持时间同步。将 [inventory.example.json](inventory.example.json) 复制为 `inventory.json`：
 
 ```json
 {
   "controller": "10.80.10.10",
+  "controllers": ["10.80.10.10", "10.80.10.11", "10.80.10.12"],
   "mysql1": "10.80.10.21",
   "mysql2": "10.80.20.22",
   "proxy1": "10.80.10.31",
@@ -299,436 +27,417 @@ nano inventory.json
 }
 ```
 
-生成并测试：
+`controller` 必须等于 `controllers` 的第一项。删除 `controllers` 可生成兼容的单 controller 五机配置，但该模式没有控制端高可用，不作为生产推荐拓扑。
+
+安全组仅开放私网流量：
+
+| 端口 | 目标节点 | 允许来源 | 用途 |
+|---:|---|---|---|
+| 22/TCP | 全部 | 管理网；controller 到四台业务节点 | 运维与故障复核 |
+| 8080/TCP | controller | 管理网、四台业务节点 | HTTP 管理、注册、路由 API |
+| 50052/TCP | controller | 四台业务节点 | probe gRPC 上报 |
+| 2379/TCP | controller | 三台 controller | etcd client |
+| 2380/TCP | controller | 三台 controller | etcd peer |
+| 3306/TCP | MySQL | controller、Proxy、MySQL 对端 | 核验、业务后端与复制 |
+| 10000/TCP | Proxy | 应用网、controller | 应用数据端口与核验 |
+| 11000/TCP | Proxy | controller | Proxy 管理端口 |
+
+不要把 8080、50052、2379、2380、3306 或 11000 暴露到公网。由于本方案不启用 TLS，安全组、私网路由和主机防火墙是访问边界。
+
+所有主机安装 Docker Engine、systemd、Python 3 和 OpenSSH，并执行 `sudo systemctl enable --now docker`。controller1 额外安装 `mysql-client`。构建机需要 Docker Buildx；如果直接在 Ubuntu amd64 仓库目录执行 `make build`，也可使用本机 Go 1.26。
+
+## 2. 构建并固定部署产物
+
+以下命令在仓库根目录执行。推荐用 Docker 构建 Linux/amd64 二进制，避免构建机架构影响：
 
 ```bash
+release=$(git rev-parse --short HEAD)
+mkdir -p deploy/dbha-v2/ec2/dist
+
+docker buildx build --platform linux/amd64 --target runtime \
+  -f deploy/dbha-v2/Dockerfile \
+  -t "dbha-v2-runtime:${release}" --load .
+
+cid=$(docker create "dbha-v2-runtime:${release}")
+docker cp "$cid:/usr/local/bin/dbha-server" deploy/dbha-v2/ec2/dist/dbha-server
+docker cp "$cid:/usr/local/bin/dbha-probe" deploy/dbha-v2/ec2/dist/dbha-probe
+docker rm "$cid"
+chmod 0755 deploy/dbha-v2/ec2/dist/dbha-server deploy/dbha-v2/ec2/dist/dbha-probe
+
+docker buildx build --platform linux/amd64 \
+  -t dbha-ec2-proxy:local --load deploy/dbha-v2/ec2/proxy
+docker save dbha-ec2-proxy:local | gzip -c > deploy/dbha-v2/ec2/dist/dbha-ec2-proxy.tar.gz
+
+(cd deploy/dbha-v2/ec2/dist && \
+  sha256sum dbha-server dbha-probe dbha-ec2-proxy.tar.gz > SHA256SUMS)
+```
+
+`proxy/Dockerfile` 会校验蓝鲸 Proxy 发布包的固定 SHA256。三台 controller 必须使用同一份 `dbha-server`，四台业务节点必须使用同一份 `dbha-probe`。分发后在每台机器重新校验对应文件的 SHA256。
+
+## 3. 生成配置
+
+在构建机或受控运维机执行：
+
+```bash
+cd deploy/dbha-v2/ec2
+cp inventory.example.json inventory.json
+# 编辑 inventory.json 后生成；默认输出到 generated/
 python3 configure.py --inventory inventory.json
-python3 test_configure.py
-ls generated
+python3 -m unittest test_configure.py
 ```
 
-输出包含 `controller/`、`mysql1/`、`mysql2/`、`proxy1/`、`proxy2/`、`inventory.json`、`secrets.env`。默认切换关闭。
+首次生成时，脚本通过 `ssh-keyscan` 取得四台业务节点的 ed25519 主机公钥。必须通过 EC2 串口控制台或可信管理通道核对指纹；不一致时停止部署。生成器会保留 deployment/agent UUID、Proxy UUID、管理员 token、密码和 SSH 固定公钥，使用相同 inventory 重跑不会重置身份。修改已生成环境的 IP 会被拒绝。
 
-`secrets.env` 是主凭据文件，保存好且只留给管理员。重新运行生成器会保留凭据；检测到同一输出目录的 IP 清单变化会拒绝，避免意外改写已有拓扑。更换 IP 需要先做迁移，而不是删除清单绕过保护。
+关键输出：
 
-关键端口/配置已自动写好：
-
-| 文件 | 关键内容 |
-|---|---|
-| controller/admin.yaml | admin gRPC 50051、管理库、etcd |
-| controller/receiver.yaml | gRPC 50052、管理库写入 |
-| controller/analysis.yaml | metadata API、SSH 用户 dbha、切换策略、SQL 凭据 |
-| controller/metadata.env | 8080 API、MySQL DSN、token |
-| controller/mysql-init/ | 元数据 schema、实际 IP seed、dbha_store 账户 |
-| 节点/probe.yaml | 本机私网 IP、采集凭据、controller 50051/50052 |
-| mysql1、mysql2/mysql-init/ | dbha、repl、app 账户 |
-| proxy1、proxy2/proxy.env | Proxy admin 凭据、元数据 API |
-| 节点/ssh-password | DBHA SSH 检测账户密码 |
-
-## 7. 分发并安装配置
-
-controller 配置直接从本机 generated 安装。其他四台配置通过管理电脑中转，每次只传该主机目录：
-
-```bash
-# 管理电脑示例：mysql1；对另三台改目录和目标 IP
-scp -r -i /path/to/dbha-ec2.pem \
-  ubuntu@<CONTROLLER_PUBLIC_IP>:/home/ubuntu/dbha-source/deploy/dbha-v2/ec2/generated/mysql1 \
-  /tmp/dbha-config-mysql1
-scp -r -i /path/to/dbha-ec2.pem /tmp/dbha-config-mysql1 ubuntu@<MYSQL1_PUBLIC_IP>:/tmp/
+```text
+generated/
+├── controller/       # controller1 配置及复制初始化文件
+├── controller2/      # controller2 配置
+├── controller3/      # controller3 配置
+├── mysql1/
+├── mysql2/
+├── proxy1/
+├── proxy2/
+└── _generated/       # 身份、管理员 token 和内部生成文件
 ```
 
-**controller：**
+所有私密文件模式为 0600。`generated/`、`inventory.json` 和 `dist/` 不得提交 Git。备份 `generated/_generated/identity.json` 与 `generated/_generated/admin.token`；丢失后不要重新生成一套身份覆盖现有 etcd 数据。
+
+## 4. 安装三个 controller
+
+先只分发 controller 配置。业务节点的 `agent.token` 要在控制端启动并完成注册后才会生成。
+
+每台 controller 需要：
+
+- `dist/dbha-server`
+- 本机对应的 `generated/controller[N]/`
+- `install-host.sh` 和完整 `systemd/` 目录
+
+以 controller1 为例，在目标机执行：
 
 ```bash
-cd "$HOME/dbha-source/deploy/dbha-v2/ec2"
-sudo install -o root -g dbha -m 0640 generated/controller/*.yaml /etc/dbha/
-sudo install -o root -g root -m 0600 generated/controller/*.env /etc/dbha/
-sudo install -o root -g root -m 0600 generated/controller/*-client.cnf /etc/dbha/
-sudo install -o root -g root -m 0600 generated/controller/bootstrap-replication.sql /etc/dbha/
-sudo install -m 0644 generated/controller/mysql.cnf /etc/dbha/mysql.cnf
-sudo install -d -m 0755 /etc/dbha/mysql-init
-sudo install -m 0644 generated/controller/mysql-init/*.sql /etc/dbha/mysql-init/
+sudo install -d -m 0755 /opt/dbha/bin
+sudo install -m 0755 /tmp/dbha-server /opt/dbha/bin/dbha-server
+sudo bash /tmp/dbha-ec2/install-host.sh controller /tmp/dbha-config
+sudo docker pull gcr.io/etcd-development/etcd:v3.6.0
+sudo systemctl enable dbha-etcd dbha-server
 ```
 
-**mysql1/mysql2，修改 `HOST_CONFIG` 为该机实际目录：**
+controller2、controller3 分别使用角色名 `controller2`、`controller3` 和对应配置目录。`install-host.sh` 会安装 `/etc/dbha` 下的 server/etcd 配置，创建 `/srv/dbha/etcd`、`/srv/dbha/server`，并安装两个 systemd 单元。
+
+先在三台机器启动 etcd：
 
 ```bash
-HOST_CONFIG=/tmp/dbha-config-mysql1
-sudo install -o root -g dbha -m 0640 "$HOST_CONFIG/probe.yaml" /etc/dbha/probe.yaml
-sudo install -m 0600 "$HOST_CONFIG/mysql.env" /etc/dbha/mysql.env
-sudo install -m 0600 "$HOST_CONFIG/ssh-password" /etc/dbha/ssh-password
-sudo install -m 0644 "$HOST_CONFIG/mysql.cnf" /etc/dbha/mysql.cnf
-sudo install -d -m 0755 /etc/dbha/mysql-init
-sudo install -m 0644 "$HOST_CONFIG"/mysql-init/*.sql /etc/dbha/mysql-init/
+sudo systemctl start dbha-etcd
 ```
 
-**proxy1/proxy2，同样修改目录：**
+在任一 controller 检查三成员和 quorum：
 
 ```bash
-HOST_CONFIG=/tmp/dbha-config-proxy1
-sudo install -o root -g dbha -m 0640 "$HOST_CONFIG/probe.yaml" /etc/dbha/probe.yaml
-sudo install -m 0600 "$HOST_CONFIG/proxy.env" /etc/dbha/proxy.env
-sudo install -m 0600 "$HOST_CONFIG/ssh-password" /etc/dbha/ssh-password
-sudo install -d -m 0750 /var/log/mysql-proxy
-```
-
-`mysql-init` 内 SQL 设为 0644，是因为官方 MySQL entrypoint 以容器 mysql 用户读取；宿主机上父目录 `/etc/dbha` 保持 root:dbha 0750，不向普通用户开放。这些 SQL 含初始化密码，不能搬到公共目录。元数据服务的 EnvironmentFile 由 systemd 读取，保持 root:root 0600。
-
-配置安装并核对成功后，删除管理电脑和节点上本次中转的 `/tmp/dbha-config-<节点>` 目录，避免留下多份明文密码。保留 controller 的受限 `generated/` 目录及其凭据备份；不要把它放进源码包。
-
-## 8. 四台节点：配置 DBHA 专用 SSH 用户
-
-这里 DBHA 的检测账户是 `dbha`，你的 EC2 管理登录仍是 `ubuntu` + PEM。当前 v2 SSH detector 使用密码/交互式认证，没有把 EC2 PEM 私钥接入 detector 配置。
-
-**mysql1、mysql2、proxy1、proxy2：**
-
-```bash
-sudo sh -c 'printf "dbha:%s\n" "$(cat /etc/dbha/ssh-password)" | chpasswd'
-sudo tee /etc/ssh/sshd_config.d/60-dbha.conf >/dev/null <<'SSHCONF'
-Match User dbha
-    PasswordAuthentication yes
-    KbdInteractiveAuthentication no
-    AllowTcpForwarding no
-    X11Forwarding no
-    PermitTunnel no
-Match all
-SSHCONF
-sudo /usr/sbin/sshd -t
-sudo systemctl reload ssh
-```
-
-确认有效设置，addr 换成 controller 私网 IP：
-
-```bash
-sudo /usr/sbin/sshd -T -C user=dbha,host=controller,addr=10.80.10.10 \
-  | grep -E 'passwordauthentication|kbdinteractiveauthentication'
-```
-
-必须看到 `passwordauthentication yes`。如果你在 AMI 中另设了 `AllowUsers`、`DenyUsers`、PAM 或账户过期策略，也要允许 `dbha`。本方案不授予该账户 sudo 权限。
-
-**先不要启用自动切换。**密码或 SG 配错导致 SSH 失败，可能被 v2 当成主机故障。
-
-## 9. 安装 systemd 单元
-
-**controller：**
-
-```bash
-cd "$HOME/dbha-source/deploy/dbha-v2/ec2"
-sudo install -m 0644 systemd/dbha@.service systemd/standalone-metadata.service \
-  systemd/dbha-mysql.service systemd/dbha-etcd.service /etc/systemd/system/
-sudo systemctl daemon-reload
-```
-
-**mysql1、mysql2：**
-
-```bash
-cd "$HOME/dbha-source/deploy/dbha-v2/ec2"
-sudo install -m 0644 systemd/dbha@.service systemd/dbha-mysql.service /etc/systemd/system/
-sudo systemctl daemon-reload
-```
-
-**proxy1、proxy2：**
-
-```bash
-cd "$HOME/dbha-source/deploy/dbha-v2/ec2"
-sudo docker build --platform linux/amd64 -t dbha-ec2-proxy:local proxy/
-sudo install -m 0644 systemd/dbha@.service systemd/dbha-proxy.service /etc/systemd/system/
-sudo systemctl daemon-reload
-```
-
-`dbha@admin`/`receiver`/`analysis`/`probe` 都复用同一个 unit 模板，但只启动对应机器需要的实例。PID 位于 `/run/dbha-<服务>/<服务>.pid`，日志位于 `/var/log/dbha/`。
-
-MySQL/Proxy 使用 Docker host network，因此直接监听 EC2 私网地址所在网络空间，不需要 Docker bridge 固定 IP 或 `-p` 映射。3306/10000/11000 的访问由前面的 EC2 安全组限制。
-
-## 10. controller：先启动管理库与 etcd
-
-```bash
-sudo systemctl start dbha-mysql dbha-etcd
-sudo systemctl status dbha-mysql dbha-etcd --no-pager
-```
-
-MySQL 初始化可能需要几十秒，服务进程 active 不代表数据库已经就绪。确认：
-
-```bash
-sudo mysql --defaults-extra-file=/etc/dbha/root-client.cnf -h127.0.0.1 \
-  -e 'SELECT VERSION(); SELECT ip,instance_role,status FROM dbha_metadata.standalone_instances;'
+endpoints=http://10.80.10.10:2379,http://10.80.10.11:2379,http://10.80.10.12:2379
 sudo docker exec dbha-etcd /usr/local/bin/etcdctl \
-  --endpoints=http://10.80.10.10:2379 endpoint health
+  --endpoints="$endpoints" endpoint health --cluster
+sudo docker exec dbha-etcd /usr/local/bin/etcdctl \
+  --endpoints="$endpoints" endpoint status --cluster -w table
+sudo docker exec dbha-etcd /usr/local/bin/etcdctl \
+  --endpoints="$endpoints" member list -w table
 ```
 
-元数据应恰好包含四个节点，IP 与 inventory 一致。初始化 SQL 只在空 MySQL 数据目录执行。若已有卷缺少表，不要靠重启碰运气，也不要删除数据盘，先检查初始化日志。
-
-### 10.1 迁移 v2 数据库
+三个成员健康后，在三台机器启动 server：
 
 ```bash
-sudo -u dbha /opt/dbha/bin/dbha-admin migrate --type all -c /etc/dbha/admin.yaml
+sudo systemctl start dbha-server
 ```
 
-应成功退出，创建 `dbha_data` 和默认策略。
-
-启动原生 metadata、admin、receiver：
+所有 `/healthz` 应返回 200，只有一个 `/readyz` 返回 200；另外两个 follower 返回 503：
 
 ```bash
-sudo systemctl start standalone-metadata
-curl -fsS http://10.80.10.10:8080/healthz
-sudo systemctl start dbha@admin dbha@receiver
-sudo systemctl status standalone-metadata dbha@admin dbha@receiver --no-pager
-sudo ss -lntp | grep -E ':(8080|50051|50052)\b'
+for ip in 10.80.10.10 10.80.10.11 10.80.10.12; do
+  printf '%s health=%s ready=%s\n' "$ip" \
+    "$(curl -sS -o /dev/null -w '%{http_code}' "http://$ip:8080/healthz")" \
+    "$(curl -sS -o /dev/null -w '%{http_code}' "http://$ip:8080/readyz")"
+done
 ```
 
-metadata health 应返回 `{"status":"ok"}`。此时暂不启动 analysis，先把业务主备和 Proxy 都验证正常。
+follower 的业务 API 返回 `503 NOT_LEADER`。这是正常状态，不应把 follower 从客户端地址池删除。
 
-## 11. 启动 MySQL 主备、建立 GTID 复制
+## 5. 注册 deployment 和四个 agent
 
-**mysql1/mysql2：**
+控制端健康后，在保存 `generated/` 的运维机运行一次幂等注册：
+
+```bash
+cd deploy/dbha-v2/ec2
+python3 register.py --output generated --servers \
+  http://10.80.10.10:8080 \
+  http://10.80.10.11:8080 \
+  http://10.80.10.12:8080
+```
+
+脚本只在连接失败、超时或明确收到 `NOT_LEADER` 时换址。它创建 deployment、签发 agent 凭据并把 token 写入各业务节点目录，不填写 MySQL 主备角色或 Proxy 后端。重复执行复用相同 deployment 和已存在的 token。
+
+确认以下文件均存在后再安装业务节点：
+
+```bash
+test -s generated/mysql1/agent.token
+test -s generated/mysql2/agent.token
+test -s generated/proxy1/agent.token
+test -s generated/proxy2/agent.token
+```
+
+## 6. 安装 MySQL 节点
+
+向 mysql1/mysql2 分发 `dist/dbha-probe`、对应的 `generated/mysqlN/`、`install-host.sh` 和 `systemd/`。每台 MySQL 节点执行，角色名按本机选择：
+
+```bash
+sudo install -d -m 0755 /opt/dbha/bin
+sudo install -m 0755 /tmp/dbha-probe /opt/dbha/bin/dbha-probe
+sudo bash /tmp/dbha-ec2/install-host.sh mysql1 /tmp/dbha-config
+sudo docker pull mysql:8.0-debian
+sudo systemctl enable dbha-mysql dbha-probe
+```
+
+安装器会创建 `/srv/dbha/mysql`、`/srv/dbha/probe`，并安装 MySQL 初始化账户、`mysql.cnf`、discovery 配置和 probe token。首次初始化前确认数据盘为空；已有 MySQL 或复制关系不能套用本初始化流程。
+
+当前生成配置使用受限的 `dbha` SSH 密码账户执行故障复核。密码取本机配置目录的 `ssh-password`：
+
+```bash
+sudo sh -c 'printf "dbha:%s\n" "$(cat /tmp/dbha-config/ssh-password)" | chpasswd'
+sudo rm -f /tmp/dbha-config/ssh-password
+```
+
+只对 `dbha` 用户开放密码登录，并把 22/TCP 限制到 controller 私网地址。禁止 root 密码登录。随后从 controller 验证固定主机公钥：
+
+```bash
+sudo -u dbha ssh \
+  -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile=/etc/dbha/ssh_known_hosts \
+  dbha@10.80.10.21 true
+```
+
+启动两台 MySQL：
 
 ```bash
 sudo systemctl start dbha-mysql
-sudo journalctl -u dbha-mysql -n 50 --no-pager
+sudo docker exec dbha-mysql sh -c \
+  'mysqladmin ping -h127.0.0.1 -uroot -p"$MYSQL_ROOT_PASSWORD"'
 ```
 
-**切回 controller 执行本节余下的全部 SQL 命令：**下面私网 IP 按实际清单替换。MySQL 客户端和 root-client.cnf 只安装在 controller，mysql1/mysql2 无需这些客户端文件。
+仅对于两台全新实例，在 controller1 先确认 mysql2 没有现有复制通道、两侧 GTID 已开启，然后初始化复制：
 
 ```bash
-sudo mysql --defaults-extra-file=/etc/dbha/root-client.cnf -h10.80.10.21 \
-  -e 'SELECT @@server_id,@@gtid_mode;'
 sudo mysql --defaults-extra-file=/etc/dbha/root-client.cnf -h10.80.20.22 \
-  -e 'SELECT @@server_id,@@gtid_mode; SHOW SLAVE STATUS\G'
-```
-
-应分别是 `21/ON` 和 `22/ON`。**仅当 mysql2 是全新备库，`SHOW SLAVE STATUS` 无行且没有待保留数据时，继续初始化。**如果已经有复制关系，先核实它，不覆盖已有关系。
-
-```bash
-sudo sh -c 'mysql --defaults-extra-file=/etc/dbha/root-client.cnf -h10.80.20.22 < /etc/dbha/bootstrap-replication.sql'
+  -e 'SHOW REPLICA STATUS\G'
 sudo mysql --defaults-extra-file=/etc/dbha/root-client.cnf -h10.80.20.22 \
-  -e 'SHOW SLAVE STATUS\G'
-```
-
-应看到 `Slave_IO_Running: Yes`、`Slave_SQL_Running: Yes`、`Auto_Position: 1`。再验证数据：
-
-```bash
-sudo mysql --defaults-extra-file=/etc/dbha/root-client.cnf -h10.80.10.21 <<'SQL'
-CREATE DATABASE IF NOT EXISTS lab;
-CREATE TABLE IF NOT EXISTS lab.ha_probe (
-  id BIGINT PRIMARY KEY AUTO_INCREMENT,
-  note VARCHAR(128),
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-INSERT INTO lab.ha_probe(note) VALUES ('ec2-bootstrap');
-SQL
+  < /etc/dbha/bootstrap-replication.sql
 sudo mysql --defaults-extra-file=/etc/dbha/root-client.cnf -h10.80.20.22 \
-  -e 'SELECT * FROM lab.ha_probe;'
+  -e 'SHOW REPLICA STATUS\G'
 ```
 
-等备库读到 `ec2-bootstrap` 后再继续。复制 IO/SQL 报错时，先解决凭据、SG、GTID 和数据一致性问题。
-
-## 12. 启动 Proxy 与四个宿主机 probe
-
-**proxy1/proxy2：**
+最后启动两台 MySQL probe：
 
 ```bash
+sudo systemctl start dbha-probe
+sudo -u dbha /opt/dbha/bin/dbha-probe discover-health -c /etc/dbha/discovery.json
+```
+
+## 7. 安装 Proxy 节点
+
+向 proxy1/proxy2 分发 `dist/dbha-probe`、`dist/dbha-ec2-proxy.tar.gz`、对应的 `generated/proxyN/`、`install-host.sh` 和 `systemd/`。每台 Proxy 节点执行：
+
+```bash
+sudo install -d -m 0755 /opt/dbha/bin
+sudo install -m 0755 /tmp/dbha-probe /opt/dbha/bin/dbha-probe
+gzip -dc /tmp/dbha-ec2-proxy.tar.gz | sudo docker load
+sudo bash /tmp/dbha-ec2/install-host.sh proxy1 /tmp/dbha-config
+sudo systemctl enable dbha-probe dbha-proxy
+```
+
+同样设置 `dbha` SSH 密码并从三个 controller 校验固定主机公钥。然后先启动 probe，再启动 Proxy：
+
+```bash
+sudo systemctl start dbha-probe
 sudo systemctl start dbha-proxy
-sudo journalctl -u dbha-proxy -n 30 --no-pager
-sudo tail -30 /var/log/mysql-proxy/proxy.log
-sudo ss -lntp | grep -E ':(10000|11000)\b'
 ```
 
-日志应出现当前 mysql1 的 backend 地址。Proxy 启动需要 metadata API 可用且返回唯一可用主库；查不到时会失败退出，不使用写死的旧主地址。
+Proxy 容器内 supervisor 会从 `server_urls` 地址池取得启动许可，使用控制端确认的当前主库启动 Proxy，并报告完成。probe 写入 `/run/dbha/route-reconcile.json` 时，supervisor 会停止本机受控 Proxy 并重新取许可；宿主机 probe 和 SSH 保持运行。
 
-**四台节点都执行：**
+## 8. 验收与启用切换
+
+在任一 controller 使用同一个静态地址池查询：
 
 ```bash
-sudo systemctl start dbha@probe
-sudo -u dbha /opt/dbha/bin/dbha-probe health -j -c /etc/dbha/probe.yaml
+servers=http://10.80.10.10:8080,http://10.80.10.11:8080,http://10.80.10.12:8080
+sudo -u dbha /opt/dbha/bin/dbha-server -c /etc/dbha/server.json ctl \
+  --servers "$servers" GET /api/v1/clusters
 ```
 
-应返回 `status=running`、`db_types=["mysql"]`。
+验收条件：
 
-**controller：验证真实 SSH 路径。**对四个节点逐个执行，第一次核对 SSH 主机指纹后接受，输入生成的 `SSH_PASSWORD`：
+- 集群状态为 `READY`，`recovery_gate=NONE`。
+- 主备 UUID、复制方向和 endpoint 与实际 MySQL 一致。
+- 两个 Proxy 都是 ACTIVE，路由指向同一个正式主库。
+- 两个 Proxy 的 10000 端口均能完成应用写入、读取和 `SELECT @@server_id`。
+- 三台 server 仅一个 `/readyz=200`，三个 `/healthz=200`。
+- 自动切换仍为关闭状态。
+
+显式启用切换前，从集群响应取得当前 `cluster_id` 和 `topology_epoch`：
 
 ```bash
-ssh dbha@10.80.10.21 '/opt/dbha/bin/dbha-probe health -j -c /etc/dbha/probe.yaml'
-ssh dbha@10.80.20.22 '/opt/dbha/bin/dbha-probe health -j -c /etc/dbha/probe.yaml'
-ssh dbha@10.80.10.31 '/opt/dbha/bin/dbha-probe health -j -c /etc/dbha/probe.yaml'
-ssh dbha@10.80.20.32 '/opt/dbha/bin/dbha-probe health -j -c /etc/dbha/probe.yaml'
+cat >/tmp/enable-switching.json <<'JSON'
+{"expected_epoch":0,"enabled":true}
+JSON
+
+sudo -u dbha /opt/dbha/bin/dbha-server -c /etc/dbha/server.json ctl \
+  --servers "$servers" --data-file /tmp/enable-switching.json \
+  PUT /api/v1/clusters/1/switching
 ```
 
-四个都成功才继续；EC2 的 PEM 管理登录成功，不能代替这四次 `dbha` 密码认证检查。
+示例中的 `cluster_id=1` 和 `expected_epoch=0` 必须替换为实时值。管理 CLI 只对连接失败和 `NOT_LEADER` 换址，不会用其他节点掩盖鉴权、版本冲突或业务错误。
 
-## 13. controller：检查采集和双 Proxy 读写
+## 9. 无 VIP HA 故障演练
+
+`dbha-server` 使用 30 秒 etcd owner lease。正常停止会主动释放 owner，硬故障则在 lease 到期后接管。最近本机双进程实测的硬故障接管时间为约 29 秒。
+
+计划维护：
 
 ```bash
-sudo mysql --defaults-extra-file=/etc/dbha/root-client.cnf -h127.0.0.1 <<'SQL'
-SELECT db_ip, db_port, harvest_type,
-       MAX(report_timestamp) AS latest,
-       UNIX_TIMESTAMP()-MAX(report_timestamp) AS age_seconds
-FROM dbha_data.t_dbha_status
-GROUP BY db_ip, db_port, harvest_type;
-SQL
+# 在当前 leader 上执行
+sudo systemctl stop dbha-server
 ```
 
-业务 MySQL 应有 3306 指标；Proxy 应有 10000 数据端口和 11000 管理端口指标。连续观察，数据时间应更新，不能只看表里“曾经有记录”。
-
-用普通 app 账户通过双 Proxy 操作：
+确认另一台 controller 的 `/readyz` 变为 200，Probe、Proxy supervisor 和管理 CLI 自动切换地址。重新启动原节点后，它应作为 follower 加入：
 
 ```bash
-sudo mysql --defaults-extra-file=/etc/dbha/app-client.cnf -h10.80.10.31 -P10000 lab \
-  -e "SELECT @@server_id; INSERT INTO ha_probe(note) VALUES ('ec2-through-proxy1');"
-sudo mysql --defaults-extra-file=/etc/dbha/app-client.cnf -h10.80.20.32 -P10000 lab \
-  -e "SELECT @@server_id; SELECT * FROM ha_probe WHERE note='ec2-through-proxy1';"
+sudo systemctl start dbha-server
 ```
 
-两个 `@@server_id` 都应为 `21`。不使用 root 写入代替应用权限验证。
+硬故障演练应在维护窗口停止或关机当前 leader EC2，而不是只向 systemd 托管进程发送 `SIGKILL`，因为 `Restart=on-failure` 会自动拉起进程。验收以下场景：
 
-接着启动 analysis，仍保持默认关闭切换：
+1. 关闭一个 controller：etcd 保持 2/3 quorum，standby 在租约窗口内接管。
+2. 仅停止 leader 本机 etcd：server 可使用另外两个 etcd endpoint；不得出现两个 `/readyz=200`。
+3. 恢复节点：它同步当前 owner heartbeat 和水位后保持 follower。
+4. 同时失去两个 etcd 成员：控制端 ready 失败并停止新切换，现有 Proxy 路由不被自动改写。
+
+每次演练都检查 `/api/v1/leader`、`/metrics` 中的 `dbha_server_leader`、etcd member/quorum 和两个 Proxy 的实际后端。
+
+## 10. 滚动升级
+
+始终先备份 etcd 和 controller 水位。三个 server 使用同一提交构建的二进制，逐台执行：
 
 ```bash
-sudo systemctl start dbha@analysis
-sudo tail -50 /var/log/dbha/analysis.log
+sudo systemctl stop dbha-server
+sudo install -m 0755 /tmp/dbha-server.new /opt/dbha/bin/dbha-server
+sudo systemctl start dbha-server
+curl -fsS http://127.0.0.1:8080/healthz
 ```
 
-先观察至少一分钟。除未接入蓝鲸告警的提示外，不应持续出现数据库鉴权失败、SSH 失败、元数据拉取失败或指标无法写入。
+先升级 follower，确认其重新同步后再处理另一 follower，最后切走并升级 leader。不要同时停止两个 etcd 成员。业务节点的 probe 也逐台升级；升级 Proxy 镜像时先确认另一 Proxy 可用，并保持旧主隔离状态不变。
 
-## 14. 启用自动切换，演练 EC2 主机故障
+## 11. 备份与三节点 etcd 恢复
 
-**controller：**
+每天至少保存一次 etcd snapshot，并分别备份三个 controller 的 `/srv/dbha/server/control-watermark.json`。示例在 controller1 执行：
 
 ```bash
-cd "$HOME/dbha-source/deploy/dbha-v2/ec2"
-python3 configure.py --inventory inventory.json --enable-switching
-sudo install -o root -g dbha -m 0640 generated/controller/analysis.yaml /etc/dbha/analysis.yaml
-sudo systemctl restart dbha@analysis
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+sudo install -d -m 0700 /srv/dbha/backups
+sudo docker exec dbha-etcd /usr/local/bin/etcdctl \
+  --endpoints=http://127.0.0.1:2379 \
+  snapshot save "/tmp/dbha-${stamp}.db"
+sudo docker cp "dbha-etcd:/tmp/dbha-${stamp}.db" "/srv/dbha/backups/dbha-${stamp}.db"
+sudo cp -a /srv/dbha/server/control-watermark.json \
+  "/srv/dbha/backups/control-watermark-${stamp}-controller1.json"
+sudo sha256sum "/srv/dbha/backups/dbha-${stamp}.db" \
+  > "/srv/dbha/backups/dbha-${stamp}.sha256"
 ```
 
-这一步只替换 analysis 配置，不重新初始化数据库或重新分发 seed。
+将 snapshot、sha256 和三个独立水位复制到独立备份存储。恢复前先备份当前状态，并停止两台 Proxy，避免恢复管理状态期间继续提供未核验路由；宿主机 probe 保持运行。
 
-**故障注入前记录 mysql1 的 EC2 Instance ID，核对 Name、私网 IP、环境标签。**在 AWS 控制台只对这台实验 mysql1 选择 **Stop instance**，不要选 Terminate，也不要停 controller。这是实际停止 EC2，会影响其中所有进程。
+三节点恢复顺序：
 
-停止整个 EC2 会使 MySQL、probe 和 SSH 一起不可达。只停止 MySQL 容器而保留 SSH 可达，不能当作同一个故障测试。
+1. 停止两台 `dbha-proxy` 和三台 `dbha-server`，保持业务节点 probe 与旧 etcd 暂时可用。
+2. 在至少一台 controller 执行 `dbha-server -c /etc/dbha/server.json prepare-restore`，写入随机代次的 `restore-required`。
+3. 停止三台 `dbha-etcd`。
+4. 在每台机器用同一个 snapshot、相同 initial cluster 和新的共同 cluster token 恢复本机成员。
+5. 启动三个 etcd 并确认 3/3 健康。
+6. 先启动带 marker 的 server，确认所有集群为 `RESTORE_UNVERIFIED` 且切换关闭，再启动两个 standby。
+7. 使用 `/api/v1/recovery/reconcile` 核验真实 MySQL 和已停止的 Proxy；成功后启动两个 Proxy，重新核验路由，仍需显式重新启用切换。
 
-**controller：**
+停止控制服务并写 marker：
 
 ```bash
-sudo tail -f /var/log/dbha/analysis.log
+sudo systemctl stop dbha-proxy        # 两台 Proxy 执行
+sudo systemctl stop dbha-server       # 三台都执行
+sudo -u dbha /opt/dbha/bin/dbha-server -c /etc/dbha/server.json prepare-restore
+sudo systemctl stop dbha-etcd         # 三台都执行
 ```
 
-另开终端查看元数据：
+以下命令在每台 controller 分别执行，替换 `member_name`、`member_ip`、snapshot 名和 token。三台必须使用完全相同的 `initial_cluster` 与 `restore_token`：
 
 ```bash
-sudo mysql --defaults-extra-file=/etc/dbha/root-client.cnf -h127.0.0.1 \
-  -e 'SELECT ip,instance_role,status FROM dbha_metadata.standalone_instances;'
+snapshot=dbha-20260925T000000Z.db
+member_name=controller1
+member_ip=10.80.10.10
+initial_cluster='controller1=http://10.80.10.10:2380,controller2=http://10.80.10.11:2380,controller3=http://10.80.10.12:2380'
+restore_token='dbha-restore-20260925T000000Z'
+
+cd /srv/dbha/backups
+sudo sha256sum -c "${snapshot%.db}.sha256"
+sudo mv /srv/dbha/etcd "/srv/dbha/etcd.before-${restore_token}"
+
+sudo docker run --rm --entrypoint /usr/local/bin/etcdutl \
+  -v /srv/dbha/backups:/backups:ro \
+  -v /srv/dbha:/srv-dbha \
+  gcr.io/etcd-development/etcd:v3.6.0 \
+  snapshot restore "/backups/$snapshot" \
+  --data-dir=/srv-dbha/etcd \
+  --name="$member_name" \
+  --initial-cluster="$initial_cluster" \
+  --initial-cluster-token="$restore_token" \
+  --initial-advertise-peer-urls="http://$member_ip:2380"
 ```
 
-预期 mysql2 成为 `backend_master`，mysql1 变为 `backend_slave/unavailable`。时间取决于配置的指标窗口、SSH 超时和切换窗口，不把某个固定秒数视为保证。
+三个成员都完成后启动 etcd 和 server。恢复出的 etcd cluster ID 会变化；旧 leader、旧 lease 和旧水位不会被直接信任。如果 snapshot 中仍有旧 owner lease，带 marker 的节点可能等待最多一个约 30 秒的 lease 窗口，禁止手工删除 owner key。它取得恢复 owner 后会强制设置 RESTORE_UNVERIFIED，standby 只有观察到当前 cluster ID 的 live owner heartbeat 后才接受新水位。
 
-验证故障后普通用户写入：
+构造恢复请求时必须列出全部处于门禁的集群：
+
+```json
+{
+  "gate": "RESTORE_UNVERIFIED",
+  "clusters": [
+    {"cluster_id": 1, "expected_epoch": 3}
+  ]
+}
+```
 
 ```bash
-sudo mysql --defaults-extra-file=/etc/dbha/app-client.cnf -h10.80.10.31 -P10000 lab \
-  -e "SELECT @@server_id; INSERT INTO ha_probe(note) VALUES ('ec2-after-failover');"
-sudo mysql --defaults-extra-file=/etc/dbha/app-client.cnf -h10.80.20.32 -P10000 lab \
-  -e "SELECT @@server_id; SELECT * FROM ha_probe WHERE note='ec2-after-failover';"
+servers=http://10.80.10.10:8080,http://10.80.10.11:8080,http://10.80.10.12:8080
+sudo -u dbha /opt/dbha/bin/dbha-server -c /etc/dbha/server.json ctl \
+  --servers "$servers" --data-file /tmp/reconcile.json \
+  POST /api/v1/recovery/reconcile
+
+# reconcile 成功后在两台 Proxy 执行
+sudo systemctl start dbha-proxy
 ```
 
-两边应返回 `22`，并能读到故障后写入。然后在 proxy1 上：
+恢复 marker 带随机代次；水位保存已消费代次。即使进程在写水位后、删除 marker 前崩溃，同一 marker 也不会在以后重新打开恢复门禁。不要复制、删除或手工降低水位文件来强制启动。
+
+## 12. 常用排障
 
 ```bash
-sudo systemctl restart dbha-proxy
+sudo systemctl status dbha-etcd dbha-server dbha-probe dbha-mysql dbha-proxy
+sudo journalctl -u dbha-server -n 200 --no-pager
+sudo journalctl -u dbha-probe -n 200 --no-pager
+sudo docker logs --tail 200 dbha-etcd
+sudo docker logs --tail 200 dbha-mysql
+sudo docker logs --tail 200 dbha-proxy
 ```
 
-重新验证 proxy1 返回 `22`，确认 Proxy 从 MySQL 元数据读取新主。
+- 三台 `/healthz=200` 但全部 `/readyz=503`：检查 etcd quorum、owner key、状态水位和 `restore-required`，不要删除 `/srv/dbha/server`。
+- probe 不能上报：检查 50052/TCP、`server_grpc_endpoints`、agent token 权限和本机 `/srv/dbha/probe/identity.json`。
+- Proxy 不启动：检查 probe 是否先上报 STARTING、恢复门禁、启动许可、`/run/dbha` 共享挂载和 supervisor 日志。
+- 集群不进入 READY：检查 MySQL GTID、复制通道、read_only/super_read_only、固定 SSH host key 和两个 Proxy 实际后端。
+- 重跑生成器提示 inventory 不匹配：不要编辑旧 identity；先确认是扩容、迁移还是新环境，再使用对应流程。
+- 已切换的旧主必须保持隔离，人工重建复制并通过维护 API 核验后才能重新加入。当前实现不提供严格 STONITH 或自动 rejoin。
 
-## 15. 演练后关闭切换，不盲目启动旧主
-
-**controller：**
-
-```bash
-cd "$HOME/dbha-source/deploy/dbha-v2/ec2"
-python3 configure.py --inventory inventory.json
-sudo install -o root -g dbha -m 0640 generated/controller/analysis.yaml /etc/dbha/analysis.yaml
-sudo systemctl restart dbha@analysis
-```
-
-mysql1 EC2 保持停止。v2 没有为你实现旧主 fencing 或自动 rejoin。恢复旧主前，需要先确保它无法接受应用写入，再基于新主重新建立一致的备库，最后才更新元数据/恢复检查；不能直接把旧角色恢复为 master。
-
-本手册在业务 MySQL 上只使用 `systemctl start`，没有自动执行开机 enable，减少实验旧主重启后未经检查立即启动数据库的机会。**这不等于 fencing**，也不阻止误操作手动启动。
-
-若确认环境和恢复流程后需要开机启动，可按角色显式配置：
-
-```bash
-# controller：管理组件
-sudo systemctl enable dbha-mysql dbha-etcd standalone-metadata dbha@admin dbha@receiver dbha@analysis
-# 四台节点：probe
-sudo systemctl enable dbha@probe
-# 两台 Proxy：Proxy
-sudo systemctl enable dbha-proxy
-```
-
-systemd 的 `network-online` 只说明本机网络初始化，不保证远端 MySQL/etcd 已就绪。单元会对失败重试，但连续失败会触发启动限流；依赖恢复后用 `systemctl reset-failed <unit>` 再 `start`，并按第 10–13 步验收。不要在未经恢复设计前批量 enable 业务 MySQL。
-
-## 16. 常用排障
-
-| 现象 | 优先检查 |
-|---|---|
-| Go 提示版本太低 | `go version`、PATH、GOTOOLCHAIN；Ubuntu 默认 Go 可能不满足模块要求 |
-| 找不到 go-pubpkg | workspace 是否同时包含两个源码模块，`go env GOWORK` 是否指向本次文件 |
-| 没有 standalone-metadata 目录 | 是否 clone 了本独立仓库并检出预期提交 |
-| 元数据表不存在 | MySQL 数据目录是否为空首次初始化；`journalctl -u dbha-mysql` |
-| v2 写 deleted_at 零日期失败 | 管理 MySQL 的 mysql.cnf 是否被读取，SQL mode 是否包含 NO_ZERO_DATE |
-| metadata unit 启动失败 | `/etc/dbha/metadata.env` 是否存在、dbha_store 授权和真实 controller IP 是否一致 |
-| probe health PID 不存在 | 是否用了包含 health 修复的源码；配置 pid 路径是否与 RuntimeDirectory 一致 |
-| native probe 无法写日志 | `/var/log/dbha` 权限和 dbha 用户；别把整个目录改成 root-only |
-| SSH 能用 ubuntu 登录但 DBHA 失败 | dbha 密码、Match User、SG 的 controller→节点22规则、PAM/账户状态 |
-| Proxy 1045 | app/MySQL认证、Proxy users白名单；admin端口使用admin账户，数据端口使用app/dbha |
-| 切换后 Proxy 重启失败 | 元数据 API 可用性；是否恰好一个 running/available master |
-| 指标不更新 | probe日志、节点到controller50052的SG、receiver到管理MySQL的权限 |
-| MySQL unit active 但3306不可用 | 容器初始化未完成/失败；`docker logs dbha-mysql`，不要仅依据systemd active |
-| 切换后新主只读 | 本实验未设只读；v2不会自动关闭read_only，外部只读配置需要另行处理 |
-
-日志命令：
-
-```bash
-sudo journalctl -u dbha@analysis -n 100 --no-pager
-sudo tail -100 /var/log/dbha/analysis.log
-sudo journalctl -u standalone-metadata -n 100 --no-pager
-sudo tail -100 /var/log/dbha/probe.log
-sudo docker logs --tail 100 dbha-mysql
-```
-
-查询切换日志（controller）：
-
-```bash
-sudo mysql --defaults-extra-file=/etc/dbha/root-client.cnf -h127.0.0.1 \
-  -e 'SELECT content FROM dbha_data.t_db_switching_log ORDER BY id DESC LIMIT 30;'
-```
-
-## 17. 本手册明确没有完成的生产能力
-
-1. 管理 MySQL、etcd、admin/receiver/analysis 目前是单 controller 部署，不是管理面 HA。
-2. 未实现旧主隔离、自动修复或重新加入；etcd 锁仅协调切换执行者。
-3. 当前策略不是任意 MySQL SQL 故障都切换，必须理解 SSH 二次确认语义。
-4. checksum 检查按研究配置跳过；复制延迟 `Seconds_Behind_Master=NULL` 在当前上游实现中放行，不保证零数据丢失。
-5. 备用 MySQL 默认可写，因为现有 v2 不执行提升后的 `read_only=OFF`。应用通过 Proxy 写入，SG 限制直连。
-6. 没有 DNS/VIP/NLB 自动接管；客户端使用两个明确的 Proxy 地址。本手册未启用原图中的读域名或从库读流量切换。
-7. SSH detector 当前不验证服务端 host key，内部 API/gRPC/etcd 也未配置 TLS；这里依赖隔离的研究 VPC，生产需要补足身份与传输保护。
-8. dbha SQL 账户权限、共享实验凭据和 Proxy root 白名单按研究复现简化，不能直接作为生产最小权限方案。
-
-## 18. 文件索引
-
-- `inventory.example.json`：五台机器私网地址示例。
-- `configure.py`：复用上一级配置生成器，输出每台机器配置；不安装或启动服务。
-- `test_configure.py`：地址/角色配置、凭据保留、模式切换测试。
-- `systemd/`：原生 DBHA、metadata，以及 MySQL/etcd/Proxy 容器的 systemd 单元。
-- `proxy/`：EC2 专用 Proxy 镜像，仅运行 Proxy，不包含 probe/sshd。
-- 上一级 `README.md`：来源工作区的 Docker HA 历史实验记录及本项目演练步骤。
-
-官方资料： [BlueKing DBM](https://github.com/TencentBlueKing/blueking-dbm)、[Proxy 发布包](https://github.com/TencentBlueKing/blueking-dbm/releases/download/v1.0.0/mysql-proxy-0.82.15.tar.gz)、[etcd 安装](https://etcd.io/docs/v3.6/install/)。
-
-## 19. 来源工作区历史验证记录（2026-09-09）
-
-- `python3 test_configure.py`：2 项测试通过，覆盖凭据保留、地址转换、原生路径、切换开关和重复主机拒绝。
-- Ubuntu 24.04 容器中 `systemd-analyze verify`：4 个实际 DBHA 实例及 metadata/MySQL/etcd/Proxy 单元通过；只检查单元结构，未启动 systemd 服务。
-- EC2 Proxy 镜像构建成功；独立临时容器从现有实验 metadata 读取新主，查询返回 `server_id=22`，验证后临时容器已停止。
-- Proxy 入口脚本语法检查通过。
-- 当时的源码归档已检查不含 generated 配置或既有实验密码；本仓库检出的文件仍需在提交前检查。
-- 尚未在五台真实 EC2 执行本手册；AWS 网络、EBS、原生 systemd 进程及 EC2 stop 故障演练以你的逐步验收结果为准。
+systemd 单元的职责和依赖关系见 [systemd/README.md](systemd/README.md)。功能边界与验收记录见 [自动元数据 PRD](../../../docs/design/automatic-metadata-prd.md) 和 [验收状态](../../../docs/design/acceptance-status.md)。

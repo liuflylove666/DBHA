@@ -1,0 +1,7 @@
+# Optional local cross-build path for a workstation with Go 1.26 installed.
+# The default Dockerfile remains the reproducible build-from-source path.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* && mkdir -p /run/dbha /var/log/dbha
+COPY deploy/dbha-v2/.build/dbha-server deploy/dbha-v2/.build/dbha-probe /usr/local/bin/
+WORKDIR /etc/dbha

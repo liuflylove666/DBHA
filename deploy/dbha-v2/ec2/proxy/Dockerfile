@@ -8,5 +8,6 @@ RUN curl -fL --retry 5 --connect-timeout 20 --max-time 180 https://github.com/Te
     && mkdir -p /opt/mysql-proxy && tar -xzf /tmp/proxy.tar.gz -C /opt/mysql-proxy --strip-components=1 && rm /tmp/proxy.tar.gz
 ENV LD_LIBRARY_PATH=/opt/mysql-proxy/lib:/opt/mysql-proxy/glib-2.0/lib:/opt/mysql-proxy/libevent-2.0.15-stable/lib
 COPY entrypoint.sh /entrypoint.sh
+COPY proxy-supervisor.py /usr/local/bin/proxy-supervisor.py
 RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]

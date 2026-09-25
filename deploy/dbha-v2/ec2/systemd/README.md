@@ -1,11 +1,19 @@
 # EC2 systemd 单元
 
-完整的源码构建、用户创建、权限和启动顺序见上一级 `README.md`，以该手册为准。
+最新安装和恢复命令见 [EC2 Docker 部署文档](../README.md)。当前单元的运行边界如下：
 
-- `dbha@.service`：原生 admin、receiver、analysis、probe。每台机器只安装/启动对应实例。
-- `standalone-metadata.service`：原生 API；systemd 读取 root:root 0600 的 `/etc/dbha/metadata.env`。
-- `dbha-mysql.service`、`dbha-etcd.service`、`dbha-proxy.service`：systemd 监督 Docker host-network 容器。
+| 节点 | 启动顺序 | 说明 |
+|---|---|---|
+| controller | `dbha-etcd.service` → `dbha-server.service` | etcd 在 Docker 中运行；server 是宿主机静态二进制。server 只 `Wants` 本机 etcd，可在本机 etcd 失败时继续访问另外两个 endpoint |
+| MySQL | `dbha-mysql.service` → `dbha-probe.service` | MySQL 在 Docker 中运行；probe 使用宿主机网络访问 127.0.0.1:3306 |
+| Proxy | `dbha-probe.service` → `dbha-proxy.service` | probe 先上报 STARTING，Proxy supervisor 再从控制端地址池申请启动许可 |
 
-原生程序使用 `dbha` 用户，PID 目录 `/run/dbha-<instance>`，日志目录 `/var/log/dbha`。数据节点的 `dbha` 用户必须可以通过 SSH 执行 health 命令，不能设置为 nologin。
+持久目录：
 
-native units 依赖网络初始化，不把远端服务的启动成功当作 systemd 本地依赖；必须按主手册逐项验证 MySQL、etcd、metadata 和 receiver。业务 MySQL 的开机启动不默认启用，以便实验旧主恢复前人工核查。
+- `/srv/dbha/etcd`：本机 etcd member 数据。
+- `/srv/dbha/server`：本机 controller 水位与恢复 marker。
+- `/srv/dbha/mysql`：本机 MySQL 数据。
+- `/srv/dbha/probe`：不可复制到其他节点的 probe boot identity。
+- `/run/dbha`：Proxy 与宿主机 probe 共享的路由重协调信号。
+
+`dbha@.service` 与 `standalone-metadata.service` 仅供旧部署保留，新架构不得安装或启用。生产节点不使用实验 Compose 文件。

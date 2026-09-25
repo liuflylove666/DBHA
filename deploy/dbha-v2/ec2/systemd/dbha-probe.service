@@ -1,0 +1,21 @@
+[Unit]
+Description=DBHA discovery probe
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/srv/dbha/probe
+
+[Service]
+Type=simple
+User=dbha
+Group=dbha
+UMask=0077
+RuntimeDirectory=dbha
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ExecStart=/opt/dbha/bin/dbha-probe discover -c /etc/dbha/discovery.json
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

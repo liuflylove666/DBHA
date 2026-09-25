@@ -51,7 +51,7 @@ PROTO_FILES = $(wildcard $(PROTO_DIR)/*.proto)
 GO_GEN_FILES=$(PROTO_FILES:$(PROTO_DIR)/%.proto=$(GEN_DIR)/%.pb.go)
 
 # services list and binary names with dbha- prefix
-SERVICES   := admin analysis receiver probe
+SERVICES   := server probe
 BIN_PREFIX := dbha-
 BINARIES   := $(addprefix $(BIN_PREFIX),$(SERVICES))
 
@@ -75,7 +75,7 @@ PROBE_PKG_NAME  = $(VERSION)-probe.tar.gz
 PROBE_WINDOWS_PKG_DIR  = $(BUILD_DIR)/$(PROJECT)-probe-windows
 PROBE_WINDOWS_PKG_NAME = $(VERSION)-probe-windows.zip
 
-SERVER_BINS = dbha-admin dbha-analysis dbha-receiver
+SERVER_BINS = dbha-server
 PROBE_BINS  = dbha-probe
 PROBE_WINDOWS_BIN = dbha-probe.exe
 
@@ -112,12 +112,15 @@ PROBE_WINDOWS_LIBS = scripts/lib/probe-event-utils.ps1
 
 # build target
 
-all: proto admin analysis receiver probe toolkits
+all: server probe
 
 proto: $(GO_GEN_FILES)
 	@goimports -w $(GEN_DIR)/*.go
 
 admin: proto
+	$(call GO_BUILD,$@)
+
+server:
 	$(call GO_BUILD,$@)
 
 analysis: proto
@@ -126,12 +129,12 @@ analysis: proto
 receiver: proto
 	$(call GO_BUILD,$@)
 
-probe: proto
+probe:
 	$(call GO_BUILD,$@)
 
 # Windows probe build. GO_BUILD's -o has no .exe suffix, so this is a standalone
 # invocation that emits dbha-probe.exe (GOOS pinned to windows regardless of GO_OS).
-probe-windows: proto
+probe-windows:
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags=$(BUILD_FLAG) \
 				-gcflags="all=-trimpath=$(PWD)" -asmflags="all=-trimpath=$(PWD)" \
@@ -192,29 +195,13 @@ test-scripts:
 # build and package
 package: package-server package-probe package-probe-windows
 
-# server package: admin/analysis/receiver + toolkits + server-side scripts/configs
-package-server: admin analysis receiver toolkits
+# Unified server package. Deployment-specific TLS and credentials are generated
+# by the installer and intentionally never included in the archive.
+package-server: server
 	@echo "Packaging $(SERVER_PKG_NAME)..."
 	@rm -rf $(SERVER_PKG_DIR)
-	@mkdir -p $(SERVER_PKG_DIR)/bin $(SERVER_PKG_DIR)/etc \
-		$(SERVER_PKG_DIR)/logs $(SERVER_PKG_DIR)/pids \
-		$(SERVER_PKG_DIR)/toolkits
+	@mkdir -p $(SERVER_PKG_DIR)/bin
 	@cp $(addprefix $(BUILD_DIR)/,$(SERVER_BINS)) $(SERVER_PKG_DIR)/bin/
-	@cp $(addprefix $(BUILD_DIR)/,$(SERVER_TOOLKITS)) $(SERVER_PKG_DIR)/toolkits/
-	@cp $(SERVER_SCRIPTS) $(SERVER_PKG_DIR)/
-	@chmod +x $(SERVER_PKG_DIR)/render_configs.py
-	@mkdir -p $(SERVER_PKG_DIR)/lib
-	@cp $(GUARD_UTILS_LIB) $(SERVER_PKG_DIR)/lib/
-	@chmod +x $(SERVER_PKG_DIR)/lib/guard-utils.sh
-	@mkdir -p $(SERVER_PKG_DIR)/etc/templates/snippets
-	@cp $(addprefix etc/templates/,$(SERVER_TEMPLATES)) \
-		$(SERVER_PKG_DIR)/etc/templates/
-	@cp $(addprefix etc/templates/snippets/,$(SERVER_SNIPPETS)) \
-		$(SERVER_PKG_DIR)/etc/templates/snippets/
-	@cp etc/dbha-v2.server.rc.example \
-		$(SERVER_PKG_DIR)/etc/dbha-v2.server.rc.example
-	@cp $(addprefix etc/,$(SERVER_TOOLKIT_CONFIGS)) $(SERVER_PKG_DIR)/etc/
-	@sed -i 's/__VERSION__/$(VERSION)/g' $(SERVER_PKG_DIR)/setup.sh
 	@cd $(BUILD_DIR) && tar -czf $(SERVER_PKG_NAME) $(PROJECT)-server
 	@rm -rf $(SERVER_PKG_DIR)
 	@echo "Package created: $(BUILD_DIR)/$(SERVER_PKG_NAME)"
@@ -275,7 +262,8 @@ help:
 	@echo "Usage: make [target]"
 	@echo ""
 	@echo "Targets:"
-	@echo "  all        - Build all services and toolkits (default)"
+	@echo "  all        - Build dbha-server and dbha-probe (default)"
+	@echo "  server     - Build unified control service"
 	@echo "  proto      - Generate protobuf files"
 	@echo "  admin      - Build admin service"
 	@echo "  analysis   - Build analysis service"
@@ -288,7 +276,7 @@ help:
 	@echo "  bwmgr      - Build black-white list manager (dbha-bwmgr)"
 	@echo "  probe-sandbox-mock - Build local probe full-path mock (not packaged)"
 	@echo "  package    - Build and create both server and probe release packages"
-	@echo "  package-server - Create server release package (services + toolkits + etc templates)"
+	@echo "  package-server - Create unified dbha-server release package"
 	@echo "  package-probe  - Create probe release package ($(VERSION)-probe.tar.gz)"
 	@echo "  package-probe-windows - Create Windows probe release package ($(VERSION)-probe-windows.zip)"
 	@echo "  format     - Format code and tidy modules"

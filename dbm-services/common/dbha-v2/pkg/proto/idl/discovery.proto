@@ -1,0 +1,34 @@
+syntax = "proto3";
+option go_package = ".;proto";
+
+// The payload is JSON encoded discovery.Observation for PushObservation and
+// JSON encoded sampled metrics for PushSample. Envelope fields are explicit so
+// receivers can reject an old session before parsing untrusted payloads.
+message DiscoveryReport {
+  uint32 schema_version = 1;
+  string agent_id = 2;
+  string session_id = 3;
+  uint64 session_epoch = 4;
+  string instance_id = 5;
+  string stream = 6;
+  uint64 sequence = 7;
+  string sampled_at = 8;
+  int64 collection_duration_ms = 9;
+  bytes payload = 10;
+}
+
+message DiscoveryAck {
+  string instance_id = 1;
+  uint64 accepted_sequence = 2;
+  int64 stored_revision = 3;
+  bool duplicate = 4;
+  string topology_state = 5;
+  repeated string reason_codes = 6;
+  bool route_reconcile_required = 7;
+  uint64 authoritative_topology_epoch = 8;
+}
+
+service DiscoveryService {
+  rpc PushObservation(DiscoveryReport) returns (DiscoveryAck);
+  rpc PushSample(DiscoveryReport) returns (DiscoveryAck);
+}

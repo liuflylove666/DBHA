@@ -8,11 +8,8 @@ COPY dbm-services/common/go-pubpkg/ /go-pubpkg/
 RUN go work init . /go-pubpkg
 ARG TARGETARCH=amd64
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -o /out/dbha-admin ./cmd/admin && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -o /out/dbha-receiver ./cmd/receiver && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -o /out/dbha-analysis ./cmd/analysis && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -o /out/dbha-probe ./cmd/probe && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -o /out/standalone-metadata ./tools/cmd/standalone-metadata
+    CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -o /out/dbha-server ./cmd/server && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -o /out/dbha-probe ./cmd/probe
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \

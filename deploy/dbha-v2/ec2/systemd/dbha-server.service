@@ -1,0 +1,21 @@
+[Unit]
+Description=DBHA unified control service
+Wants=network-online.target
+After=network-online.target dbha-etcd.service
+Wants=dbha-etcd.service
+RequiresMountsFor=/srv/dbha/server
+
+[Service]
+Type=simple
+User=dbha
+Group=dbha
+WorkingDirectory=/opt/dbha
+UMask=0077
+ExecStart=/opt/dbha/bin/dbha-server -c /etc/dbha/server.json
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
