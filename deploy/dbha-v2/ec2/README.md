@@ -29,6 +29,18 @@
 
 `controller` 必须等于 `controllers` 的第一项。删除 `controllers` 可生成兼容的单 controller 五机配置，但该模式没有控制端高可用，不作为生产推荐拓扑。
 
+七台机器的固定分工如下。后续所有命令都使用这组示例地址；实际部署时替换为 `inventory.json` 中的地址。
+
+| 机器 | 私网 IP | 分发的配置目录 | 节点身份 | systemd 服务 | 持久化目录 |
+|---|---|---|---|---|---|
+| controller1 | `10.80.10.10` | `generated/controller/` | `controller1` | `dbha-etcd`、`dbha-server` | `/srv/dbha/etcd`、`/srv/dbha/server` |
+| controller2 | `10.80.10.11` | `generated/controller2/` | `controller2` | `dbha-etcd`、`dbha-server` | `/srv/dbha/etcd`、`/srv/dbha/server` |
+| controller3 | `10.80.10.12` | `generated/controller3/` | `controller3` | `dbha-etcd`、`dbha-server` | `/srv/dbha/etcd`、`/srv/dbha/server` |
+| mysql1 | `10.80.10.21` | `generated/mysql1/` | MySQL 初始主库，`server-id=21` | `dbha-mysql`、`dbha-probe` | `/srv/dbha/mysql`、`/srv/dbha/probe` |
+| mysql2 | `10.80.20.22` | `generated/mysql2/` | MySQL 初始备库，`server-id=22` | `dbha-mysql`、`dbha-probe` | `/srv/dbha/mysql`、`/srv/dbha/probe` |
+| proxy1 | `10.80.10.31` | `generated/proxy1/` | Proxy 1 | `dbha-probe`、`dbha-proxy` | `/srv/dbha/probe` |
+| proxy2 | `10.80.20.32` | `generated/proxy2/` | Proxy 2 | `dbha-probe`、`dbha-proxy` | `/srv/dbha/probe` |
+
 安全组仅开放私网流量：
 
 | 端口 | 目标节点 | 允许来源 | 用途 |
@@ -108,13 +120,41 @@ generated/
 
 先只分发 controller 配置。业务节点的 `agent.token` 要在控制端启动并完成注册后才会生成。
 
-每台 controller 需要：
+三台 controller 共用以下内容：
 
 - `dist/dbha-server`
-- 本机对应的 `generated/controller[N]/`
 - `install-host.sh` 和完整 `systemd/` 目录
+- `server.json.etcd_endpoints`：三个 etcd client 地址
+- `ETCD_INITIAL_CLUSTER`：三个 etcd peer 地址
+- 同一份 `admin.token` 和 `ssh_known_hosts`
 
-以 controller1 为例，在目标机执行：
+每台机器的 `server.json.node_id`、`advertise_http`、`advertise_grpc`、`ETCD_NAME` 和 etcd 监听地址必须使用本机值，不能把 controller1 的目录复制给另外两台。分发时统一把本机配置目录放到 `/tmp/dbha-config`，把部署目录放到 `/tmp/dbha-ec2`，把二进制放到 `/tmp/dbha-server`。
+
+在 `deploy/dbha-v2/ec2` 目录执行以下命令完成三台 controller 的逐机分发。示例使用 Ubuntu AMI 默认用户 `ubuntu`；使用其他镜像时替换 SSH 用户：
+
+```bash
+while read -r ip config_dir; do
+  host="ubuntu@$ip"
+  ssh "$host" 'rm -rf /tmp/dbha-config /tmp/dbha-ec2 && mkdir -p /tmp/dbha-config /tmp/dbha-ec2'
+  scp dist/dbha-server "$host:/tmp/dbha-server"
+  scp -r "generated/$config_dir/." "$host:/tmp/dbha-config/"
+  scp install-host.sh "$host:/tmp/dbha-ec2/install-host.sh"
+  scp -r systemd "$host:/tmp/dbha-ec2/"
+done <<'HOSTS'
+10.80.10.10 controller
+10.80.10.11 controller2
+10.80.10.12 controller3
+HOSTS
+```
+
+### 4.1 controller1：10.80.10.10
+
+- 配置来源：`generated/controller/`
+- 安装角色：`controller`
+- 预期身份：`node_id=controller1`、`ETCD_NAME=controller1`
+- 通告地址：`http://10.80.10.10:8080`、`10.80.10.10:50052`
+
+在 controller1 执行：
 
 ```bash
 sudo install -d -m 0755 /opt/dbha/bin
@@ -122,9 +162,49 @@ sudo install -m 0755 /tmp/dbha-server /opt/dbha/bin/dbha-server
 sudo bash /tmp/dbha-ec2/install-host.sh controller /tmp/dbha-config
 sudo docker pull gcr.io/etcd-development/etcd:v3.6.0
 sudo systemctl enable dbha-etcd dbha-server
+sudo grep -E '"(node_id|advertise_http|advertise_grpc)"' /etc/dbha/server.json
+sudo grep -E '^ETCD_(NAME|LISTEN_CLIENT_URLS|LISTEN_PEER_URLS)=' /etc/dbha/etcd.env
 ```
 
-controller2、controller3 分别使用角色名 `controller2`、`controller3` 和对应配置目录。`install-host.sh` 会安装 `/etc/dbha` 下的 server/etcd 配置，创建 `/srv/dbha/etcd`、`/srv/dbha/server`，并安装两个 systemd 单元。
+### 4.2 controller2：10.80.10.11
+
+- 配置来源：`generated/controller2/`
+- 安装角色：`controller2`
+- 预期身份：`node_id=controller2`、`ETCD_NAME=controller2`
+- 通告地址：`http://10.80.10.11:8080`、`10.80.10.11:50052`
+
+在 controller2 执行：
+
+```bash
+sudo install -d -m 0755 /opt/dbha/bin
+sudo install -m 0755 /tmp/dbha-server /opt/dbha/bin/dbha-server
+sudo bash /tmp/dbha-ec2/install-host.sh controller2 /tmp/dbha-config
+sudo docker pull gcr.io/etcd-development/etcd:v3.6.0
+sudo systemctl enable dbha-etcd dbha-server
+sudo grep -E '"(node_id|advertise_http|advertise_grpc)"' /etc/dbha/server.json
+sudo grep -E '^ETCD_(NAME|LISTEN_CLIENT_URLS|LISTEN_PEER_URLS)=' /etc/dbha/etcd.env
+```
+
+### 4.3 controller3：10.80.10.12
+
+- 配置来源：`generated/controller3/`
+- 安装角色：`controller3`
+- 预期身份：`node_id=controller3`、`ETCD_NAME=controller3`
+- 通告地址：`http://10.80.10.12:8080`、`10.80.10.12:50052`
+
+在 controller3 执行：
+
+```bash
+sudo install -d -m 0755 /opt/dbha/bin
+sudo install -m 0755 /tmp/dbha-server /opt/dbha/bin/dbha-server
+sudo bash /tmp/dbha-ec2/install-host.sh controller3 /tmp/dbha-config
+sudo docker pull gcr.io/etcd-development/etcd:v3.6.0
+sudo systemctl enable dbha-etcd dbha-server
+sudo grep -E '"(node_id|advertise_http|advertise_grpc)"' /etc/dbha/server.json
+sudo grep -E '^ETCD_(NAME|LISTEN_CLIENT_URLS|LISTEN_PEER_URLS)=' /etc/dbha/etcd.env
+```
+
+三个安装动作都会创建 `/etc/dbha`、`/srv/dbha/etcd`、`/srv/dbha/server` 并安装 `dbha-etcd.service` 和 `dbha-server.service`。上面的检查只显示节点身份和地址，不要输出 `admin.token`。
 
 先在三台机器启动 etcd：
 
@@ -185,9 +265,39 @@ test -s generated/proxy1/agent.token
 test -s generated/proxy2/agent.token
 ```
 
+token 生成后，在 `deploy/dbha-v2/ec2` 目录执行以下命令完成四台业务机器的逐机分发：
+
+```bash
+while read -r ip config_dir kind; do
+  host="ubuntu@$ip"
+  ssh "$host" 'rm -rf /tmp/dbha-config /tmp/dbha-ec2 && mkdir -p /tmp/dbha-config /tmp/dbha-ec2'
+  scp dist/dbha-probe "$host:/tmp/dbha-probe"
+  scp -r "generated/$config_dir/." "$host:/tmp/dbha-config/"
+  scp install-host.sh "$host:/tmp/dbha-ec2/install-host.sh"
+  scp -r systemd "$host:/tmp/dbha-ec2/"
+  if [[ "$kind" == proxy ]]; then
+    scp dist/dbha-ec2-proxy.tar.gz "$host:/tmp/dbha-ec2-proxy.tar.gz"
+  fi
+done <<'HOSTS'
+10.80.10.21 mysql1 mysql
+10.80.20.22 mysql2 mysql
+10.80.10.31 proxy1 proxy
+10.80.20.32 proxy2 proxy
+HOSTS
+```
+
 ## 6. 安装 MySQL 节点
 
-向 mysql1/mysql2 分发 `dist/dbha-probe`、对应的 `generated/mysqlN/`、`install-host.sh` 和 `systemd/`。每台 MySQL 节点执行，角色名按本机选择：
+两台 MySQL 都需要 `dist/dbha-probe`、本机配置目录、`install-host.sh` 和完整 `systemd/` 目录。分发时把本机配置放到 `/tmp/dbha-config`，部署目录放到 `/tmp/dbha-ec2`，二进制放到 `/tmp/dbha-probe`。
+
+### 6.1 mysql1：10.80.10.21
+
+- 配置来源：`generated/mysql1/`
+- 安装角色：`mysql1`
+- MySQL：监听 `3306`，`server-id=21`，初始主库
+- Probe：以 `dbha` 用户运行，向三个 controller 的 `50052` 端口上报
+
+在 mysql1 执行：
 
 ```bash
 sudo install -d -m 0755 /opt/dbha/bin
@@ -195,9 +305,28 @@ sudo install -m 0755 /tmp/dbha-probe /opt/dbha/bin/dbha-probe
 sudo bash /tmp/dbha-ec2/install-host.sh mysql1 /tmp/dbha-config
 sudo docker pull mysql:8.0-debian
 sudo systemctl enable dbha-mysql dbha-probe
+sudo grep -E '^(server-id|gtid-mode|enforce-gtid-consistency)=' /etc/dbha/mysql.cnf
 ```
 
-安装器会创建 `/srv/dbha/mysql`、`/srv/dbha/probe`，并安装 MySQL 初始化账户、`mysql.cnf`、discovery 配置和 probe token。首次初始化前确认数据盘为空；已有 MySQL 或复制关系不能套用本初始化流程。
+### 6.2 mysql2：10.80.20.22
+
+- 配置来源：`generated/mysql2/`
+- 安装角色：`mysql2`
+- MySQL：监听 `3306`，`server-id=22`，完成复制初始化后作为初始备库
+- Probe：以 `dbha` 用户运行，向三个 controller 的 `50052` 端口上报
+
+在 mysql2 执行：
+
+```bash
+sudo install -d -m 0755 /opt/dbha/bin
+sudo install -m 0755 /tmp/dbha-probe /opt/dbha/bin/dbha-probe
+sudo bash /tmp/dbha-ec2/install-host.sh mysql2 /tmp/dbha-config
+sudo docker pull mysql:8.0-debian
+sudo systemctl enable dbha-mysql dbha-probe
+sudo grep -E '^(server-id|gtid-mode|enforce-gtid-consistency)=' /etc/dbha/mysql.cnf
+```
+
+两次安装都会创建 `/srv/dbha/mysql`、`/srv/dbha/probe`，并安装 MySQL 初始化账户、`mysql.cnf`、discovery 配置和 probe token。首次初始化前确认两台机器的数据盘均为空；已有 MySQL 或复制关系不能套用本初始化流程。
 
 当前生成配置使用受限的 `dbha` SSH 密码账户执行故障复核。密码取本机配置目录的 `ssh-password`：
 
@@ -206,16 +335,18 @@ sudo sh -c 'printf "dbha:%s\n" "$(cat /tmp/dbha-config/ssh-password)" | chpasswd
 sudo rm -f /tmp/dbha-config/ssh-password
 ```
 
-只对 `dbha` 用户开放密码登录，并把 22/TCP 限制到 controller 私网地址。禁止 root 密码登录。随后从 controller 验证固定主机公钥：
+只对 `dbha` 用户开放密码登录，并把 22/TCP 限制到 controller 私网地址。禁止 root 密码登录。随后从每台 controller 验证两台 MySQL 的固定主机公钥：
 
 ```bash
-sudo -u dbha ssh \
-  -o StrictHostKeyChecking=yes \
-  -o UserKnownHostsFile=/etc/dbha/ssh_known_hosts \
-  dbha@10.80.10.21 true
+for ip in 10.80.10.21 10.80.20.22; do
+  sudo -u dbha ssh \
+    -o StrictHostKeyChecking=yes \
+    -o UserKnownHostsFile=/etc/dbha/ssh_known_hosts \
+    "dbha@$ip" true
+done
 ```
 
-启动两台 MySQL：
+分别在 mysql1 和 mysql2 启动本机 MySQL：
 
 ```bash
 sudo systemctl start dbha-mysql
@@ -234,7 +365,7 @@ sudo mysql --defaults-extra-file=/etc/dbha/root-client.cnf -h10.80.20.22 \
   -e 'SHOW REPLICA STATUS\G'
 ```
 
-最后启动两台 MySQL probe：
+最后分别在 mysql1 和 mysql2 启动本机 probe：
 
 ```bash
 sudo systemctl start dbha-probe
@@ -243,7 +374,16 @@ sudo -u dbha /opt/dbha/bin/dbha-probe discover-health -c /etc/dbha/discovery.jso
 
 ## 7. 安装 Proxy 节点
 
-向 proxy1/proxy2 分发 `dist/dbha-probe`、`dist/dbha-ec2-proxy.tar.gz`、对应的 `generated/proxyN/`、`install-host.sh` 和 `systemd/`。每台 Proxy 节点执行：
+两台 Proxy 都需要 `dist/dbha-probe`、`dist/dbha-ec2-proxy.tar.gz`、本机配置目录、`install-host.sh` 和完整 `systemd/` 目录。分发时把本机配置放到 `/tmp/dbha-config`，部署目录放到 `/tmp/dbha-ec2`，二进制和镜像包分别放到 `/tmp/dbha-probe`、`/tmp/dbha-ec2-proxy.tar.gz`。
+
+### 7.1 proxy1：10.80.10.31
+
+- 配置来源：`generated/proxy1/`
+- 安装角色：`proxy1`
+- 数据端口：`10000`；管理端口：`11000`
+- Probe：以 `dbha` 用户运行，向三个 controller 的 `50052` 端口上报
+
+在 proxy1 执行：
 
 ```bash
 sudo install -d -m 0755 /opt/dbha/bin
@@ -253,7 +393,42 @@ sudo bash /tmp/dbha-ec2/install-host.sh proxy1 /tmp/dbha-config
 sudo systemctl enable dbha-probe dbha-proxy
 ```
 
-同样设置 `dbha` SSH 密码并从三个 controller 校验固定主机公钥。然后先启动 probe，再启动 Proxy：
+### 7.2 proxy2：10.80.20.32
+
+- 配置来源：`generated/proxy2/`
+- 安装角色：`proxy2`
+- 数据端口：`10000`；管理端口：`11000`
+- Probe：以 `dbha` 用户运行，向三个 controller 的 `50052` 端口上报
+
+在 proxy2 执行：
+
+```bash
+sudo install -d -m 0755 /opt/dbha/bin
+sudo install -m 0755 /tmp/dbha-probe /opt/dbha/bin/dbha-probe
+gzip -dc /tmp/dbha-ec2-proxy.tar.gz | sudo docker load
+sudo bash /tmp/dbha-ec2/install-host.sh proxy2 /tmp/dbha-config
+sudo systemctl enable dbha-probe dbha-proxy
+```
+
+分别在 proxy1 和 proxy2 设置 `dbha` SSH 密码，然后删除明文临时文件：
+
+```bash
+sudo sh -c 'printf "dbha:%s\n" "$(cat /tmp/dbha-config/ssh-password)" | chpasswd'
+sudo rm -f /tmp/dbha-config/ssh-password
+```
+
+从每台 controller 验证两个 Proxy 的固定主机公钥：
+
+```bash
+for ip in 10.80.10.31 10.80.20.32; do
+  sudo -u dbha ssh \
+    -o StrictHostKeyChecking=yes \
+    -o UserKnownHostsFile=/etc/dbha/ssh_known_hosts \
+    "dbha@$ip" true
+done
+```
+
+然后分别在 proxy1 和 proxy2 先启动 probe，再启动 Proxy：
 
 ```bash
 sudo systemctl start dbha-probe
